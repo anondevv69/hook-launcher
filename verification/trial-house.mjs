@@ -90,8 +90,10 @@ console.log('== B. doors swap-ix account order (contract §2.2/§2.3) ==');
   const expectHead = [pool, MINT, D.NATIVE_MINT, tokenVault, quoteVault, userToken, userQuote, USER, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID];
   const buy = D.buildHouseSwapKeys({ ...base, dir: 0, amountIn: 1000n });
   ok(JSON.stringify(buy.keys.slice(0, 10).map(k => k.pubkey.toBase58())) === JSON.stringify(expectHead.map(k => k.toBase58()))
-    && buy.keys[3].isWritable && buy.keys[4].isWritable && buy.keys[5].isWritable && buy.keys[6].isWritable && buy.keys[7].isSigner && !buy.keys[7].isWritable,
-    'B1 buy: head order = [pool, token_mint, quote_mint, token_vault(w), quote_vault(w), user_token(w), user_quote(w), user(signer), token_prog, quote_prog]');
+    && buy.keys[0].isWritable && buy.keys[3].isWritable && buy.keys[4].isWritable && buy.keys[5].isWritable && buy.keys[6].isWritable && buy.keys[7].isSigner && buy.keys[7].isWritable,
+    'B1 buy: head order = [pool(w), token_mint, quote_mint, token_vault(w), quote_vault(w), user_token(w), user_quote(w), user(signer, w), token_prog, quote_prog] — INTEGRATION §1 flags: pool writable (fee counters accrue in place), user signer+writable (rule-2 escrow funding debits / dip refunds credit the user\'s lamports; a read-only user fails ReadonlyDataModified — proven on mainnet by HPROOF\'s first house buy, 2026-10-20)');
+  ok(buy.keys[0].pubkey.equals(pool) && buy.keys[7].pubkey.equals(USER),
+    'B1b keys[0] is the pool and keys[7] is the user (the two accounts the HPROOF ReadonlyDataModified failure named)');
   ok(JSON.stringify(buy.keys.slice(10, 19).map(k => k.pubkey.toBase58())) === JSON.stringify(tailKeys.map(k => k.pubkey.toBase58())) && buy.keys.length === 19,
     'B2 buy without rule 2: hook tail follows verbatim (9 keys), no venue extras');
   ok(buy.data.length === 18 && buy.data[0] === 1 && buy.data[1] === 0 && buy.data.readBigUInt64LE(2) === 1000n && buy.data.readBigUInt64LE(10) === 0n,
@@ -139,6 +141,8 @@ console.log('== C. keeper planActivation matrix ==');
     && ixH.keys[0].pubkey.equals(caller) && ixH.keys[0].isSigner && ixH.keys[2].isWritable && ixH.keys[4].isWritable
     && ixH.keys[8].pubkey.equals(SystemProgram.programId) && ixH.keys[9].pubkey.equals(TOKEN_PROGRAM_ID),
     'C9 ActivateHouse ix: tag 14, §1.4 account order (caller signer, config w, house_vault w, …, system, LEGACY token program for SyncNative)');
+  ok(ixH.keys[0].isWritable && ixH.keys[7].isWritable,
+    'C9b ActivateHouse ix runtime flags: caller AND house quote vault writable (the engine pays the caller cut and credits the seed as lamports; read-only fails at runtime — the keeper shipped both read-only until the HPROOF proof, 2026-10-20)');
   const ixP = buildActivatePoolIx({ houseProgram: HOUSE_PROG, pool: D.housePoolPda(HOUSE_PROG, MINT), mint: MINT, engineConfigPda: Keypair.generate().publicKey, dbcPool: Keypair.generate().publicKey, dbcConfig: Keypair.generate().publicKey, feeBps: 100, launchRecordFeeBps: 100 });
   ok(ixP.programId.equals(HOUSE_PROG) && ixP.data[0] === 5 && ixP.data.readUInt16LE(1) === 100 && ixP.keys.length === 5 && ixP.keys[0].isWritable,
     'C10 ActivatePool ix: tag 5 + fee_bps u16, §2.2 account order (pool w, mint, engine_config, dbc_pool, dbc_config) — rate attested against the launch record');
