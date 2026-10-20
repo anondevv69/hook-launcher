@@ -1,0 +1,1 @@
+{"authorityMode":"locked","decimals":6,"holderFees":{"callerCutBps":100,"enabled":true},"migrationThresholdSol":42,"name":"Agent Reserve","rentVaultSol":0.05,"rules":[{"id":3},{"capBps":500,"id":9}],"seedSol":0,"supply":1000000000,"symbol":"AGTR"}
