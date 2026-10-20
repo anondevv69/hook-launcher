@@ -1,0 +1,17 @@
+[package]
+name = "registry"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+# Versions pinned to the installed Agave SDK's solana-program major (same as
+# the TH hook program and the engine).
+solana-program = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
