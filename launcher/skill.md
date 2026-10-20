@@ -431,7 +431,7 @@ that launched AGTR:
 | 11 | **The Grudge** | `{ "id": 11, "dumpThresholdBps": 5000, "penaltyMode": "ban" }` | Remembers dumpers and prices their return: `dumpThresholdBps`, `windowSecs`, `penaltyDurationSecs`, `penaltyMode` (`ban` or `cap`; cap requires `buyCapAmount`), `maxEscalation`. |
 | 12 | **Trading Hours** | `{ "id": 12, "tzOffsetSecs": -18000, "daysMask": 31, "windowStartMin": 540, "windowEndMin": 1020 }` | Fixed UTC offset — no DST, by design. `daysMask` bit0 = Mon … bit6 = Sun; window in minutes after local midnight; `scope` 0 = all transfers, 1 = venue transfers only. |
 | 13 | **Vesting Clock** | `{ "id": 13, "mode": "cliff", "holdSecs": 86400 }` | `mode`: `cliff` or `linear`. At least one of `holdSecs` (per-holder hold) or `releaseTs` (global release time) is required. "Released" lifts the veto — tokens never move. |
-| 14 | **Decay Tax** | `{ "id": 14, "startBps": 500, "floorBps": 100, "decaySecs": 2592000 }` | A mint-wide linear schedule on the Transfer Fee extension rate (the rate is mint-wide — per-holder decay is not expressible). Fee-extension mints only; see the settlement note. |
+| 14 | **Decay Tax** | `{ "id": 14, "startBps": 500, "floorBps": 100, "decaySecs": 2592000 }` | A mint-wide linear schedule on the Transfer Fee extension rate (the rate is mint-wide — per-holder decay is not expressible). Fee-extension mints only; see the settlement note. **Not launchable via this launcher yet:** the DBC launch path cannot create a fee-extension mint, so a rule-14 config written today could never initialize its schedule — a direct fee-extension mint path is pending. Do not put rule 14 in a launch spec. |
 | 15 | **King of the Pool** | `{ "id": 15, "titheBps": 200 }` | The engine tracks the largest holder as king. `titheBps` (0 = tracking only) routes that share of each Distributor settlement to the current king. |
 | 16 | **Buyback & Burn** | `{ "id": 16, "thresholdSol": 1, "callerCutBps": 100 }` | Crank-operated: once claimable curve fees reach the threshold, the crank buys the token on its own curve and burns it. Mutually exclusive with holder-fee routing — same SOL stream. |
 
@@ -463,7 +463,14 @@ missing record's. Rule
 14 runs on the FeeSchedule program
 (`66HUbm4tgcCsRkDL655UUrmm1aEVGugJzcYNm6NDFkFL`): fee-extension mints
 only — DBC mints cannot carry a Transfer Fee extension, and
-InitSchedule fails closed on any other mint. Its rate only ever moves
+InitSchedule fails closed on any other mint. **Rule 14 is therefore
+not launchable via the standard launcher today:** the FeeSchedule
+program is live and its fail-closed backstop is mainnet-verified
+(2026-10-20, in simulation), but no launcher-path token can use it
+until a direct fee-extension mint path ships. `launch.mjs` does not
+yet reject rule 14 at spec time — a spec carrying it would write a
+Locked config advertising a rule that can never fire, so leave it
+out. Its rate only ever moves
 down, on a permissionless crank. Rule 16 is crank-operated by the
 token's fee claimer (the crank claims the curve fees in SOL, buys on
 the token's own curve, and burns from its own account).

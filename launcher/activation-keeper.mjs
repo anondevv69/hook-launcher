@@ -202,13 +202,20 @@ export function planActivation(input) {
  *  system(ro), token_program(ro — the LEGACY token program, SyncNative)].
  * The token/quote vaults are read from the house pool record
  * (@97..129 / @129..161) by the engine; pass the same accounts here.
+ * RUNTIME FLAGS (proven by the trial's bundles and the HPROOF mainnet
+ * activation, 2026-10-20): the CALLER and the HOUSE QUOTE VAULT must be
+ * passed WRITABLE even though §1.4 lists them read-only — the engine
+ * pays the caller cut and credits the seed to the quote vault as
+ * lamports, and the runtime rejects balance changes on read-only
+ * accounts. The flags below match the proven bundle
+ * (deploy/proof-launches/activate.mjs) exactly.
  */
 export function buildActivateHouseIx({ caller, mint, configPda, dbcPool, houseVaultPda, housePool, houseTokenVault, houseQuoteVault, engineProgram = ENGINE_PROGRAM_ID }) {
   return new TransactionInstruction({
     programId: engineProgram, data: Buffer.from([14]),
     keys: [
-      K(caller, false, true), K(mint), K(configPda, true), K(dbcPool),
-      K(houseVaultPda, true), K(housePool), K(houseTokenVault), K(houseQuoteVault),
+      K(caller, true, true), K(mint), K(configPda, true), K(dbcPool),
+      K(houseVaultPda, true), K(housePool), K(houseTokenVault), K(houseQuoteVault, true),
       K(SystemProgram.programId), K(TOKEN_PROGRAM_ID),
     ],
   });

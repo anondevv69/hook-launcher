@@ -31,12 +31,12 @@
 // Env: HOOK_KEYPAIR (default ~/.hook_keypair.json), HOOK_RPC (default public mainnet RPC).
 import fs from 'fs';
 import os from 'os';
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { ComputeBudgetProgram, Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import {
   TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction,
   createTransferCheckedWithTransferHookInstruction, createSyncNativeInstruction,
 } from '@solana/spl-token';
-import { parseHouseSlot, resolveVenue, buildHouseSwapIx, housePoolPda } from './doors.mjs';
+import { parseHouseSlot, resolveVenue, buildHouseSwapIx, housePoolPda, recordHasRule2 } from './doors.mjs';
 import BN from 'bn.js';
 import { DynamicBondingCurveClient, SwapMode } from '@meteora-ag/dynamic-bonding-curve-sdk';
 
@@ -323,7 +323,11 @@ async function doHouseSwap(c, me, isBuy, uiAmount, rawIn = null, slot) {
     await sendAndConfirm(new Transaction().add(createAssociatedTokenAccountInstruction(me.publicKey, myQuoteAta, me.publicKey, NATIVE_MINT, TOKEN_PROGRAM_ID)), [me], 'create my wSOL ATA (house door quote account)');
   }
   const amountInRaw = BigInt(rawIn ?? (isBuy ? Math.round(uiAmount * LAMPORTS_PER_SOL) : Math.round(uiAmount * 10 ** c.decimals)));
-  const ixs = [];
+  // A rule-2 house swap resolves its escrow inside the swap instruction
+  // and exceeds the default CU budget (ComputationalBudgetExceeded on
+  // the HPROOF proof sell, 2026-10-20) — carry the 1.4M budget the
+  // proven driver used (deploy/proof-launches/house-trade.mjs).
+  const ixs = [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })];
   if (isBuy) {
     ixs.push(SystemProgram.transfer({ fromPubkey: me.publicKey, toPubkey: myQuoteAta, lamports: Number(amountInRaw) }));
     ixs.push(createSyncNativeInstruction(myQuoteAta));
@@ -331,6 +335,16 @@ async function doHouseSwap(c, me, isBuy, uiAmount, rawIn = null, slot) {
   const poolPda = housePoolPda(slot.program, c.mint);
   ixs.push(...(await settlesFor(c, me, poolPda))); // distributor settles, counterparty = house pool (its ATA IS the token vault)
   ixs.push(await buildHouseSwapIx(conn, { record: c.rec, slot, isBuy, user: me.publicKey, amountInRaw }));
+  if (!isBuy && recordHasRule2(c.rec)) {
+    // Venue sync note (houseswap INTEGRATION): after a rule-2 sell the
+    // depth share sits in the house quote vault as raw lamports — the
+    // venue does NOT SyncNative in-program, so the caller's transaction
+    // MUST append a top-level SyncNative for the pool's quote vault
+    // (its canonical wSOL ATA, as created at H1) or the share stays
+    // invisible to the vault's token amount.
+    const houseQuoteVault = getAssociatedTokenAddressSync(NATIVE_MINT, poolPda, true, TOKEN_PROGRAM_ID);
+    ixs.push(createSyncNativeInstruction(houseQuoteVault));
+  }
   return sendAndConfirm(new Transaction().add(...ixs), [me], isBuy ? 'buy (house)' : 'sell (house)');
 }
 // Venue routing wrapper: every swap path (buy/sell + both flows) goes

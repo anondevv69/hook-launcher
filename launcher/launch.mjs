@@ -686,6 +686,20 @@ function validateSpec(spec) {
     if (!seen.has(1)) throw new Error('rule 2 (Escrow Split) requires rule 1 (Basis Latch) enabled — escrow resolution on a sell reads the price feed and the seller\'s basis/latch state, which only rule 1 maintains.');
     warnings.push('rule 2 (Escrow Split) is venue-side: the split applies to house-venue trades after activation; curve trades are unsplit; escrow resolves only on house-venue sells. The engine itself treats rule 2 as a no-op — the venue reads split_bps from the Config PDA at swap time.');
   }
+  if (seen.has(14)) {
+    // Rule 14 (Decay Tax) is a schedule on the mint's Token-2022
+    // Transfer Fee extension rate — the FeeSchedule program modulates
+    // that extension through its fee-authority PDA. DBC creates mints
+    // with a fixed extension set (metadata pointer + transfer hook —
+    // see the configPayload fee-mirror note), so a mint launched here
+    // can never carry a Transfer Fee extension, and a rule-14 config
+    // written by this launcher could never initialize its schedule
+    // (InitSchedule fails closed with NoFeeConfig — the backstop). The
+    // Phase B deploy sheet requires this rejection at spec time. The
+    // FeeSchedule program is live; the unblock is a direct
+    // fee-extension mint path, which is not built yet.
+    throw new Error('rule 14 (Decay Tax) is not launchable through this launcher — Decay Tax is a schedule on the mint\'s Transfer Fee extension rate, and DBC mints carry a fixed extension set (metadata pointer + transfer hook) with no Transfer Fee extension, so a rule-14 config written here could never initialize its schedule. The FeeSchedule program is live on mainnet, but the direct fee-extension mint path it needs is not built yet. Drop rule 14 from the spec.');
+  }
   if (grad.mode === 'house') {
     warnings.push(`graduation "house": this token graduates onto the house venue (${HOUSE_SWAP_PROGRAM_ID.toBase58()}) when its curve quote reserve reaches ${grad.houseThresholdSol} SOL — the curve is built with the never threshold so it can never migrate; before activation the curve is the only door, after activation doors default to the house pool and the curve stays as the legacy door. The commitment is written into the engine config at launch and is immutable thereafter.`);
     warnings.push(`house seed-account exemption disclosure: the launch exempts the dedicated seed wallet's ATA (seedAta — a fresh per-launch keypair recorded in the launch record's house.seedExemption) from this token's rules, so the seed delivery into the house token vault cannot be vetoed by the very stack it seeds. The seed wallet holds nothing but the seed; the exemption is named in the record, never hidden.`);
@@ -1170,7 +1184,7 @@ if (isHouse) {
   plan.push(['H1', 'create the house vaults (owned by the house pool PDA)', 'token-2022 + legacy token (ATA creation)', `token vault=${houseTokenVault.toBase58()} — created AS the house pool PDA's canonical Token-2022 ATA for the mint (so H4b's SyncRegistered for owner = pool PDA lands in this vault's holder record); quote vault=${houseQuoteVault.toBase58()} — the pool PDA's wSOL ATA on the legacy token program`]);
   plan.push(['H2', 'houseswap InitPool (authority = launcher, pre-commit)', `program ${HOUSE_SWAP_PROGRAM_ID.toBase58()}`, `pool PDA=${housePoolPda.toBase58()} token_vault=${houseTokenVault.toBase58()} quote_vault=${houseQuoteVault.toBase58()} — the pool record's first 168 bytes mirror the TaxSwap layout; committed=0 until H5, live=0 until activation`]);
 }
-plan.push(['L3', 'engine InitializeConfig', `program ${ENGINE.toBase58()}`, `config PDA=${configPda(mint).toBase58()} mode=${spec.authorityMode ?? 'locked'}(${mode}) authority=${authority.toBase58()} rules=[${rules.map(r => `${r.id} ${RULE_NAMES[r.id]}`).join(', ') || 'none'}] venues=[DBC] exemptions=[poolAuthority=${poolAuthority.toBase58()}, baseVault=${baseVault.toBase58()}${isHouse ? `, seedAta=${seedAta.toBase58()} (the disclosed seed-account exemption), houseTokenVault=${houseTokenVault.toBase58()} (the house pool PDA's Token-2022 ATA for the mint — exempt from L3 so the H4 seed transfer is not capped by rule 9; ActivateHouse's append of it is idempotent), houseQuoteVault=${houseQuoteVault.toBase58()} (the house pool PDA's wSOL ATA — same idempotent activation append), feeDestTokenAta=${feeDestTokenAta.toBase58()} (the canonical Token-2022 ATA of fee_claimer=${feeClaimer.toBase58()} for the mint — account-scoped, so houseswap ClaimFees' token leg cannot be vetoed by rule 9 once the fee destination is over cap)` : ''}]${isHouse ? ` + house block: program=${HOUSE_SWAP_PROGRAM_ID.toBase58()} threshold=${graduation.houseThresholdLamports} lamports reserve=${houseBlock.reserveLamports} lamports (config created at CONFIG_SPACE_V2 1152 B with the HouseVault PDA; the commitment is init-only and immutable thereafter)` : ''}`]);
+plan.push(['L3', 'engine InitializeConfig', `program ${ENGINE.toBase58()}`, `config PDA=${configPda(mint).toBase58()} mode=${spec.authorityMode ?? 'locked'}(${mode}) authority=${authority.toBase58()} rules=[${rules.map(r => `${r.id} ${RULE_NAMES[r.id]}`).join(', ') || 'none'}] venues=[DBC] exemptions=[poolAuthority=${poolAuthority.toBase58()}, baseVault=${baseVault.toBase58()}${isHouse ? `, seedAta=${seedAta.toBase58()} (the disclosed seed-account exemption), houseTokenVault=${houseTokenVault.toBase58()} (the house pool PDA's Token-2022 ATA for the mint — exempt from L3 so the H4 seed transfer is not capped by rule 9; ActivateHouse's append of it is idempotent), houseQuoteVault=${houseQuoteVault.toBase58()} (the house pool PDA's wSOL ATA — same idempotent activation append), feeDestTokenAta=${feeDestTokenAta.toBase58()} (the canonical Token-2022 ATA of fee_claimer=${feeClaimer.toBase58()} for the mint — account-scoped, so houseswap ClaimFees' token leg cannot be vetoed by rule 9 once the fee destination is over cap)` : ''}]${isHouse ? ` + house block: program=${HOUSE_SWAP_PROGRAM_ID.toBase58()} threshold=${graduation.houseThresholdLamports} lamports reserve=${houseBlock.reserveLamports} lamports (config created at CONFIG_SPACE_V2 1152 B with the HouseVault PDA; the commitment is init-only and immutable thereafter)` : ''}${isHouse ? `; L3 instruction accounts = [launcher(s,w), mint, config(w), system, houseVault=${houseVaultPda.toBase58()}(w)] — the engine demands the HouseVault PDA as the 5th account on house payloads` : ''}`]);
 plan.push(['L4', 'engine InitializeExtraAccountMetas (templated per config)', `program ${ENGINE.toBase58()}`, `meta list PDA=${metaPda(mint).toBase58()} (${tpl.count} extras: ${tpl.extras.map(e => `${e.name} — ${e.why}`).join('; ')}; ${metaListSize(tpl.count)} bytes${tpl.staticList ? ' — no holder state: fully static, generic-resolver safe' : ''})`]);
 if (hasRule(1)) plan.push(['L4b', 'engine InitializePriceFeed', `program ${ENGINE.toBase58()}`, `feed PDA=${pricePda(mint).toBase58()} pool=${pool.toBase58()} token_vault=${baseVault.toBase58()} quote_vault=${quoteVault.toBase58()} decimals=${decimals}/${9}`]);
 plan.push(['L5', 'fund rent-vault PDA', 'system transfer', `${rentVaultSol} SOL → ${rentVaultPda(mint).toBase58()} (≈ ${Math.floor(rentVaultSol / RENT.holderPda)} lazy Holder PDAs)`]);
@@ -1324,8 +1338,16 @@ if (isHouse) {
 }
 {
   const cfg = { mode, authority, rules, venues: [DBC_ID], exemptions: l3Exemptions };
+  // Phase C: on a house payload the engine's initialize_config reads a
+  // FIFTH account — the HouseVault PDA, writable, after the system
+  // program (engine/src/lib.rs:1799–1801; demanded at :1824). Omitting
+  // it fails L3 with NotEnoughAccountKeys (HPROOF's first L3 attempt,
+  // 2026-10-20). The list below is exactly the corrected list the
+  // in-place resume proved on mainnet
+  // (deploy/proof-launches/resume-hproof.mjs, sig w62KD25t…).
   const ix = new TransactionInstruction({ programId: ENGINE, data: configPayload(cfg, 1, houseBlock),
-    keys: [K(launcher.publicKey, true, true), K(mint, false, false), K(configPda(mint), false, true), K(SystemProgram.programId, false, false)] });
+    keys: [K(launcher.publicKey, true, true), K(mint, false, false), K(configPda(mint), false, true), K(SystemProgram.programId, false, false),
+      ...(isHouse ? [K(houseVaultPda, false, true)] : [])] });
   sigs.engineConfig = await sendTx(new Transaction().add(ix), [launcher], 'L3 engine InitializeConfig');
 }
 {
