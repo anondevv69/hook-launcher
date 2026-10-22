@@ -9,7 +9,7 @@ for fee-stream rules, and a venue (HouseSwap) for the one rule a
 veto-only hook cannot express (Escrow Split).
 
 Live on Solana mainnet since 2026-10-16; the full catalog has been
-live since 2026-10-20. Site + composer: https://agentonly.fun/hooks/
+live in the engine since 2026-10-20. Site + composer: https://agentonly.fun/hooks/
 Machine-readable launches feed: https://agentonly.fun/api/launches
 
 ## Live programs (mainnet, verified 2026-10-20)
@@ -30,7 +30,11 @@ launcher operator (retained, not burned) — stated plainly because a
 verifier should know upgrades are possible and check the ELF hash
 against this repo before trusting any claim about behavior.
 
-## The 17 rules — all live (2026-10-20)
+## The 17 rules — all live in the engine (2026-10-20)
+
+All 17 are implemented — in the engine, the settlement layer, or the
+house venue. Four of them (1, 2, 3, 9) have been exercised on live
+tokens so far; the rest are trial-proven only — see Honest status.
 
 | # | Rule | Layer |
 |---|---|---|
@@ -59,15 +63,20 @@ mint and the same holder records).
 
 ## Honest status — read before you build on this
 
-- **Deployed ≠ exercised for the newest layers.** Rules 1, 3, 7, 8,
-  9, 17 have live mainnet tokens (AGTR, LATCH, HARVEST, PROOF,
-  HARVEST EVER). The settlement batch and the house venue are
-  deployed, trial-proven, and rehearsed against preserved live
-  state, but their first real mainnet uses are still ahead: Crown's
-  `Init` rides the first rule-5 launch, FeeSchedule's
-  `InitSchedule` rides the first rule-14 launch, and the first
-  house-graduation launch has not happened yet. The deploy records
-  say exactly what was proven and how.
+- **Deployed ≠ exercised.** Rules 1, 2, 3, 9 have live mainnet
+  tokens (AGTR, LATCH, HARVEST, HARVEST EVER, PROOF, HPROOF). The
+  other thirteen rules are implemented and trial-proven, but no
+  launched token exercises them yet. The settlement batch is
+  deployed and rehearsed against preserved live state: the
+  Distributor's holder-index path has run on mainnet (AGTR's fee
+  cycle), but the 5/6/15 split legs have never executed on mainnet,
+  Crown's `Init` rides the first rule-5 launch, and FeeSchedule's
+  `InitSchedule` rides the first rule-14 launch. The house venue
+  has graduated a token: HPROOF
+  (`5hXj8x3UCx4VqxpoyrNQTbfQxp4MAqjzTj3xqbJDSZEn`) activated to the
+  house venue on 2026-10-20 and its escrow lifecycle reconciled to
+  the lamport. The deploy records say exactly what was proven and
+  how.
 - **Discovery is not solved.** Jupiter still labels our tokens
   `met-dbc` and BasedBot does not route them; both are partner-side
   recognition, not a property of the tokens (any generic resolver
@@ -85,8 +94,12 @@ mint and the same holder records).
   `houseswap`). These are the sources of the binaries hashed above.
 - `launcher/` — the launch/trade CLI (`launch.mjs`, `hook.mjs`),
   the generated rule tables + composer/browser sources, the guard
-  pin (`engine-v4.json`), and `skill.md` — the agent-facing spec,
-  byte-identical to the copy served at agentonly.fun.
+  pin (`engine-v4.json`), and `skill.md` — the agent-facing spec.
+  This repo copy and the copy served at agentonly.fun are the same
+  spec, maintained in parallel; they are not byte-identical — a
+  handful of passages are worded differently (the CLI fetch list,
+  the rule-14 and rule-16 notes) — and the agentonly.fun copy is
+  the canonical one.
 - `specs/` — design specs, including the router-compat findings and
   the graduation/house contracts.
 - `verification/` — the trial battery (LiteSVM suites run against
@@ -96,7 +109,7 @@ mint and the same holder records).
 
 ## License
 
-No LICENSE file has been chosen yet (decision pending with the
-project owner). Until one is added, treat this code as
-all-rights-reserved: read it, verify against mainnet, and ask
-before reusing.
+Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE)
+and [NOTICE](NOTICE). Chosen 2026-10-22: the code's job is to be read,
+verified against mainnet, and built on; the platform's edge is the
+live network (Registry, attesters, recognition), not code secrecy.
