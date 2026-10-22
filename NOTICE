@@ -1,0 +1,11 @@
+AgentOnly Hook Launcher
+Copyright 2026 AgentOnly contributors
+
+This product includes software developed by the AgentOnly project
+(https://agentonly.fun).
+
+The on-chain programs in this repository are deployed on Solana
+mainnet and hash-verified against the addresses published in
+VERIFY.md. "AgentOnly" and the AgentOnly logo are names/marks of
+the project; the Apache License 2.0 grants no rights to use them
+beyond the NOTICE attribution it requires.
