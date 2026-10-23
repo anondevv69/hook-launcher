@@ -145,10 +145,10 @@ export function buildHouseSwapKeys({
 }) {
   if (dir !== 0 && dir !== 1) throw new Error(`house swap dir must be 0 (buy) or 1 (sell), got ${dir}`);
   const keys = [
-    K(pool), K(mint), K(NATIVE_MINT),
+    K(pool, true), K(mint), K(NATIVE_MINT),
     K(tokenVault, true), K(quoteVault, true),
     K(userToken, true), K(userQuote, true),
-    K(user, false, true),
+    K(user, true, true),
     K(T22), K(LEGACY_TOKEN),
     ...tail,
   ];
