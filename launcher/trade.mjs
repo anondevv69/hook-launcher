@@ -12,7 +12,7 @@
 //   node trade.mjs simulate    (same flags as build — builds, then simulates)
 //   node trade.mjs verify      --record <record.json> --sig <signature> [--wallet <pubkey>]
 //   node trade.mjs resolve-extras --record <record.json> --source <acct> --dest <acct> --authority <pubkey>   (diagnostic: from-list-bytes resolver)
-//   node trade.mjs wallet-check [--signer local-keypair|sandbox-keypair|serialized-tx|bankr|unknown] [--wallet-type own|sandbox|bankr] [--wallet <pubkey>] [--record <record.json>]
+//   node trade.mjs wallet-check [--signer local-keypair|sandbox-keypair|serialized-tx|byo-signer|bankr|unknown] [--wallet-type own|sandbox|bankr] [--wallet <pubkey>] [--record <record.json>]
 //        Signer-capability preflight: run BEFORE creating any wallet. Pure
 //        capability evaluation (no RPC); --record is optional and only adds
 //        token context (whether THIS token requires registration).
@@ -43,8 +43,9 @@ No keypair is ever loaded; build returns an UNSIGNED transaction for your own si
   node trade.mjs simulate    (build flags) — builds the same transaction and simulates it read-only
   node trade.mjs verify      --record R --sig S [--wallet W]
   node trade.mjs resolve-extras --record R --source A --dest B --authority P
-  node trade.mjs wallet-check [--signer local-keypair|sandbox-keypair|serialized-tx|bankr|unknown] [--wallet-type own|sandbox|bankr] [--wallet P] [--record R]
+  node trade.mjs wallet-check [--signer local-keypair|sandbox-keypair|serialized-tx|byo-signer|bankr|unknown] [--wallet-type own|sandbox|bankr] [--wallet P] [--record R]
         Preflight: which execution path does your signer have? Run this BEFORE hook.mjs init creates a wallet.
+        (serialized-tx covers external signers and bring-your-own signing services — aliases: signing-service, byo-signing-service, signing-api.)
 
 Amounts are UI units (SOL in for buys, tokens in for sell/send) unless --amount-raw is given.
 Exit codes: 0 ok · 1 usage/input · 2 refused or simulation failed · 3 kit/RPC error.`);

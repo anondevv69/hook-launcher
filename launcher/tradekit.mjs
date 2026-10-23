@@ -1197,7 +1197,14 @@ export async function verifyTrade(kit, c, { signature, wallet }) {
  *                          (base64) Solana transaction and returns it
  *                          signed: hardware-wallet bridges, multisig
  *                          services, wallet APIs with a real Solana
- *                          sign endpoint. Path: gateway / kit build →
+ *                          sign endpoint. Aliases include the
+ *                          bring-your-own signing-service names
+ *                          ('signing-service', 'byo-signer',
+ *                          'byo-signing-service', 'signing-api'): any
+ *                          service the agent holds its own account
+ *                          with, whose credential lives in the agent's
+ *                          own platform config — never in AgentOnly
+ *                          systems. Path: gateway / kit build →
  *                          external sign → broadcast.
  *   'bankr' | 'bankr-custodial' — Bankr's custodial wallet. Its
  *                          documented signing surface is EVM-only
@@ -1221,7 +1228,7 @@ export function normalizeSignerClass(input) {
   const s = String(input ?? '').trim().toLowerCase().replace(/_/g, '-');
   if (['own', 'local', 'local-keypair', 'keypair', 'keypair-file', 'self-custody', 'self-custodied'].includes(s)) return { signerClass: 'local-keypair', sandbox: false };
   if (['sandbox', 'sandbox-keypair', 'bankr-sandbox', 'path-b-prime', "path-b'"].includes(s)) return { signerClass: 'local-keypair', sandbox: true };
-  if (['serialized-tx', 'serialized', 'serialized-tx-signer', 'external-signer', 'hardware', 'hardware-wallet', 'multisig', 'ledger'].includes(s)) return { signerClass: 'serialized-tx-signer', sandbox: false };
+  if (['serialized-tx', 'serialized', 'serialized-tx-signer', 'external-signer', 'hardware', 'hardware-wallet', 'multisig', 'ledger', 'signing-service', 'byo-signer', 'byo-signing-service', 'signing-api'].includes(s)) return { signerClass: 'serialized-tx-signer', sandbox: false };
   if (['bankr', 'bankr-custodial', 'custodial'].includes(s)) return { signerClass: 'bankr-custodial', sandbox: false };
   return { signerClass: 'unknown', sandbox: false };
 }
@@ -1267,11 +1274,12 @@ export function walletCheck({ signer = null, walletType = null, wallet = null, t
     return {
       ...base,
       canRegister: true, canTrade: true, path: 'gateway+external-signer',
-      explanation: 'Your signer accepts serialized Solana transactions, so no local keypair file is needed at all: AgentOnly builds the exact unsigned transaction (registration, sync, and the hook-aware swap, bundled), you hand the base64 to your signer, broadcast the signed result, and verify it read-only. This is the Execution Gateway flow (or trade.mjs build locally).' + tokenNote,
+      explanation: 'Your signer accepts serialized Solana transactions, so no local keypair file is needed at all: AgentOnly builds the exact unsigned transaction (registration, sync, and the hook-aware swap, bundled), you hand the base64 to your signer, broadcast the signed result, and verify it read-only. This is the Execution Gateway flow (or trade.mjs build locally). It includes bring-your-own signing services — any service that accepts a serialized transaction and returns a signature, where you hold your own account: the service credential lives in your own platform config and is never sent to or stored by AgentOnly, which only ever produces the unsigned transaction.' + tokenNote,
       nextSteps: [
         'Get the unsigned transaction: POST the gateway /v1/trade/build (or /v1/registration/build), or run trade.mjs build — both return transactionBase64 + a manifest of what it does.',
         'Simulate before signing (gateway /v1/trade/simulate): a passed simulation is the strongest pre-flight check; a hook veto is an answer, not an error to retry blindly.',
         'Sign the base64 with your signer, broadcast it yourself, then verify the signature (trade.mjs verify) for confirmation and balance deltas.',
+        'Bring-your-own signing service: the composition is build (base64 out) → simulate → your service signs → you broadcast. Keep the service credential in your own platform config; if a so-called signing service ever asks you to upload a raw secret key instead of signing serialized transactions, it is not this class — walk away.',
       ],
     };
   }
