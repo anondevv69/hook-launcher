@@ -629,6 +629,34 @@ function validateSpec(spec) {
     seen.add(id);
     encodeParams(id, entry); // validates params eagerly
   }
+  // Settlement split sum (Phase B cross-rule check, mirrored from the
+  // engine so the refusal happens HERE, at spec time — not at config
+  // write or, worse, at settlement): the Distributor carves each
+  // distribution by rules 5 (Crown Beneficiary, crownBps), 6 (Tithe
+  // Seat, titheBps) and 15 (King of the Pool, titheBps), and the three
+  // carves share one distribution. The engine rejects a config whose
+  // ENABLED carves sum over 10000 bps (engine/src/lib.rs split_sum —
+  // disabled entries are not summed), and the Distributor hard-errors
+  // the same condition at settlement time (DistError::SplitBpsTooLarge).
+  // Effective bps are the values encodeParams writes — defaults
+  // included (500 / 300 / 0) — and the loop above already encoded every
+  // entry, so the fields are known-valid integers here.
+  {
+    let splitSum = 0;
+    const parts = [];
+    for (const entry of rules) {
+      if (entry.enabled === false) continue;
+      const id = ruleIdOf(entry);
+      const bps = id === 5 ? (entry.crownBps ?? 500)
+        : id === 6 ? (entry.titheBps ?? 300)
+        : id === 15 ? (entry.titheBps ?? 0)
+        : null;
+      if (bps != null) { splitSum += bps; parts.push(`rule ${id} (${RULE_NAMES[id]}) ${bps} bps`); }
+    }
+    if (splitSum > 10000) {
+      throw new Error(`settlement split too large: the rules 5+6+15 carves sum to ${splitSum} bps (${parts.join(' + ')}) — over the 10000 bps a distribution has. The engine rejects this at config write and the Distributor hard-errors it at settlement (SplitBpsTooLarge); fix it in the spec instead: lower crownBps (rule 5), titheBps (rule 6) or titheBps (rule 15).`);
+    }
+  }
   if (seen.has(1)) warnings.push('rule 1 (Basis Latch) on DBC: the feed prices from the pool state via the engine CrankPriceDbc instruction (reads the pool sqrt_price). The first crank must land before the first buy, and the feed must be re-cranked within max_stale_secs of any gated transfer — the trade flow handles this; a stale feed fails closed (StalePrice). See engine BUILD-NOTES.');
   if (seen.has(8)) warnings.push('rule 8 (Holder-Gated) fails closed on DBC: curve swaps resolve only the meta list, and the gate sync must sit adjacent to the transfer. Rule-8 tokens trade through surfaces that prepend SyncGateBalance (the agent skill\'s `send`, the trade page) — plain curve buys of a rule-8 token will veto. See engine BUILD-NOTES.');
   if (seen.has(7) && String((rules.find(r => ruleIdOf(r) === 7) ?? {}).mode).toLowerCase() === 'p2p-only') warnings.push('rule 7 P2P-only: venue receives are vetoed — the DBC curve can be seeded but not bought from. This is a pure social-token posture; the curve will sit idle by design.');
@@ -645,6 +673,20 @@ function validateSpec(spec) {
     if (grad.mode !== 'house') throw new Error('rule 2 (Escrow Split) requires graduation "house" — the split is enforced by the house venue, not the engine, and a curve token has no venue to split in. Set graduation "house" or drop rule 2.');
     if (!seen.has(1)) throw new Error('rule 2 (Escrow Split) requires rule 1 (Basis Latch) enabled — escrow resolution on a sell reads the price feed and the seller\'s basis/latch state, which only rule 1 maintains.');
     warnings.push('rule 2 (Escrow Split) is venue-side: the split applies to house-venue trades after activation; curve trades are unsplit; escrow resolves only on house-venue sells. The engine itself treats rule 2 as a no-op — the venue reads split_bps from the Config PDA at swap time.');
+  }
+  if (seen.has(14)) {
+    // Rule 14 (Decay Tax) is a schedule on the mint's Token-2022
+    // Transfer Fee extension rate — the FeeSchedule program modulates
+    // that extension through its fee-authority PDA. DBC creates mints
+    // with a fixed extension set (metadata pointer + transfer hook —
+    // see the configPayload fee-mirror note), so a mint launched here
+    // can never carry a Transfer Fee extension, and a rule-14 config
+    // written by this launcher could never initialize its schedule
+    // (InitSchedule fails closed with NoFeeConfig — the backstop). The
+    // Phase B deploy sheet requires this rejection at spec time. The
+    // FeeSchedule program is live; the unblock is a direct
+    // fee-extension mint path, which is not built yet.
+    throw new Error('rule 14 (Decay Tax) is not launchable through this launcher — Decay Tax is a schedule on the mint\'s Transfer Fee extension rate, and DBC mints carry a fixed extension set (metadata pointer + transfer hook) with no Transfer Fee extension, so a rule-14 config written here could never initialize its schedule. The FeeSchedule program is live on mainnet, but the direct fee-extension mint path it needs is not built yet. Drop rule 14 from the spec.');
   }
   if (grad.mode === 'house') {
     warnings.push(`graduation "house": this token graduates onto the house venue (${HOUSE_SWAP_PROGRAM_ID.toBase58()}) when its curve quote reserve reaches ${grad.houseThresholdSol} SOL — the curve is built with the never threshold so it can never migrate; before activation the curve is the only door, after activation doors default to the house pool and the curve stays as the legacy door. The commitment is written into the engine config at launch and is immutable thereafter.`);
