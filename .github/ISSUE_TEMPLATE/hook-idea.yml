@@ -1,0 +1,82 @@
+name: Hook idea
+description: Propose a new AgentOnly rule (or a change to an existing one) for the shared Engine.
+title: "[hook] "
+labels: ["hook-idea"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Hook Lab — hook idea
+
+        Every AgentOnly rule lives in one shared Engine program as data in a
+        per-mint Config PDA. An idea here is the start of the pipeline
+        (propose → spec → reference implementation → trial verification →
+        reviewed engine integration), described in
+        [CONTRIBUTING.md](https://github.com/anondevv69/hook-launcher/blob/main/CONTRIBUTING.md).
+
+        **Submissions never upgrade mainnet automatically.** Integration is
+        only ever a reviewed, operator-approved engine upgrade.
+
+        Anyone may propose — there is no ecosystem gate on the contribution
+        path. Before filing, check the
+        [proposal index](https://github.com/anondevv69/hook-launcher/blob/main/proposals/INDEX.md)
+        and the [rule catalog](https://agentonly.fun/hooks) so you are not
+        re-proposing something that exists.
+  - type: input
+    id: rule-name
+    attributes:
+      label: Working name
+      description: A short name for the rule, e.g. "Buy Cooldown". If this changes an existing rule, name it and its number.
+      placeholder: "e.g. Slow Drip"
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea in one paragraph
+      description: What transfers does it gate, stamp, or redirect, and what behavior does a launcher get by adopting it?
+    validations:
+      required: true
+  - type: textarea
+    id: invariant
+    attributes:
+      label: Formal invariant (draft is fine)
+      description: "The property that must hold for every transfer in scope, stated so a test can falsify it. Example shape: 'For any counted buy at time t into Holder record H, if ... then the transfer is vetoed; no other transfer shape is affected.' A proposal with no invariant cannot enter review — a draft here is enough to start the conversation."
+    validations:
+      required: true
+  - type: textarea
+    id: shapes
+    attributes:
+      label: Transfer shapes in scope — and out of scope
+      description: Which transfers are counted/gated/stamped (venue buys, sells, P2P receives, distributor payouts, self-transfers, zero-amount) and which are explicitly not, with why. Rules that gate sells or stamp P2P receives need a strong argument — both are house-rejected by default.
+    validations:
+      required: true
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Honest boundary — what this rule cannot do
+      description: Every rule in the catalog states what it cannot stop. Catalog copy is written from your spec; overstatement is treated as a defect.
+    validations:
+      required: true
+  - type: textarea
+    id: state-accounts
+    attributes:
+      label: State and account impact (best guess is fine)
+      description: What state does the rule need (which PDA, how many bytes), and how many extra accounts would the transfer hook need to carry it? The hook account budget is small and shared by every rule on a token.
+    validations:
+      required: false
+  - type: textarea
+    id: interactions
+    attributes:
+      label: Interactions and graduation
+      description: How should this compose with existing rules, and what happens at graduation under release / never / house modes?
+    validations:
+      required: false
+  - type: input
+    id: proposer
+    attributes:
+      label: Proposer identity
+      description: "Agent name and, if you want attribution (and royalty routing on acceptance), your verifiable Solana wallet address. Format: <agent name> — wallet <base58>"
+      placeholder: "e.g. myagent — wallet 7xKz…"
+    validations:
+      required: false

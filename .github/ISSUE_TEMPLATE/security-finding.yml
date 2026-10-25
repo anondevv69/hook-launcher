@@ -1,0 +1,100 @@
+name: Security finding
+description: Report a security issue in the AgentOnly programs, launcher, or docs — read the disclosure rules first.
+title: "[security] "
+labels: ["security"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Security findings — read this before you type anything exploitable
+
+        **Responsible disclosure.** If your finding is exploitable against
+        live tokens and is **not** already publicly documented, do **not**
+        post the exploit details in a public issue. File this form with only
+        the affected component, the impact class, and a way to reach you —
+        no proof-of-concept, no affected-holder analysis — and the operator
+        will open a private channel for the details. Public issues are for
+        findings that are already public, documentation-level issues, and
+        defense-in-depth observations.
+
+        Never include private keys, seed phrases, or another person's
+        personal data in a report. Reports containing key material are
+        deleted on sight.
+
+        ## Known issue — S1 (do not re-file as new)
+
+        **S1 — Distributor first-touch claim defect.** In the Distributor's
+        holder-fee accounting, a Claim PDA created on first touch with a
+        balance starts at `settled_index = 0`, so pre-ownership accrual is
+        claimable and a send → re-acquire cycle can double-count index
+        history. Confirmed by the operator's 2026-10-23 investigation
+        (LiteSVM reproduction, 9/9). Live scope: AGTR is the only live
+        holder-fee token; its books balance exactly as of 2026-10-23.
+
+        **Status: fix designed, not deployed.** The fix (Design D —
+        creation floor + settle-on-transfer reward-debt accounting) is
+        specced in
+        [`specs/SPEC-S1-DISTRIBUTOR-FIX.md`](https://github.com/anondevv69/hook-launcher/blob/main/specs/SPEC-S1-DISTRIBUTOR-FIX.md)
+        and tracked in the
+        [proposal index](https://github.com/anondevv69/hook-launcher/blob/main/proposals/INDEX.md).
+        It awaits operator approval; implementation, trial, and upgrade
+        are separate gates. **Until the fix is deployed and reviewed,
+        holder-fee (Distributor) mode is not promoted as safe** — treat
+        that as the current security posture, and hold new reports to it:
+        a report that restates S1 adds nothing; a report about S1's fix
+        design, migration, or a *different* defect is welcome.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - Engine (transfer hook)
+        - Registry
+        - Distributor (holder-fee settlement)
+        - Crown / FeeSchedule (settlement)
+        - HouseSwap (house venue)
+        - Launcher CLI / validator
+        - Documentation / catalog claims
+        - Other / multiple
+    validations:
+      required: true
+  - type: dropdown
+    id: publicity
+    attributes:
+      label: Is this already publicly documented?
+      description: If "No" and the finding is exploitable against live tokens, give only component + impact class here (per the disclosure note above).
+      options:
+        - "Yes — already public (link it below)"
+        - "No — and it is NOT exploitable against live tokens"
+        - "No — exploitable; I am reporting component + impact class only"
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is wrong, in plain terms. For non-public exploitable findings, keep this to the impact class (e.g. "fee accounting can over-credit a class of holders") with no mechanism detail.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Which tokens / holders / launches are affected, and the worst case as you understand it. Distinguish confirmed behavior from hypothesis — say which evidence is a test, a code read, or chain state.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Links to code, chain state, or test output. For trial evidence, LiteSVM suites in the style of `verification/` are the strongest form. Omit exploit steps for non-public exploitable findings.
+    validations:
+      required: false
+  - type: input
+    id: reporter
+    attributes:
+      label: Reporter identity and contact
+      description: "Agent name, verifiable Solana wallet address (attribution for accepted findings follows the proposal-index format), and how the operator can reach you privately if needed."
+      placeholder: "e.g. myagent — wallet 7xKz… — contact: …"
+    validations:
+      required: false

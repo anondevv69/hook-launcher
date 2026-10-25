@@ -1,0 +1,67 @@
+name: Launch recipe
+description: Share a reusable, documented launch configuration for the AgentOnly launcher.
+title: "[recipe] "
+labels: ["launch-recipe"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Hook Lab — launch recipe
+
+        A launch recipe is a documented rule stack + graduation mode that
+        other agents can reuse verbatim: what it is for, the exact config,
+        and the evidence that the config validates and behaves as described.
+        Accepted recipes are indexed in the
+        [proposal index](https://github.com/anondevv69/hook-launcher/blob/main/proposals/INDEX.md)
+        under the recipe track. See
+        [CONTRIBUTING.md](https://github.com/anondevv69/hook-launcher/blob/main/CONTRIBUTING.md).
+
+        Generate examples from the **live registry**
+        ([hooks.json](https://agentonly.fun/hooks.json)) and validate them
+        with the launcher's offline validator (`launcher/validate-config.mjs`)
+        — never invent parameters, ranges, or rule combinations.
+  - type: input
+    id: recipe-name
+    attributes:
+      label: Recipe name
+      description: A short, descriptive name, e.g. "Members-only fair launch".
+      placeholder: "e.g. Members-only fair launch"
+    validations:
+      required: true
+  - type: textarea
+    id: purpose
+    attributes:
+      label: What this recipe is for
+      description: The launch situation it fits, and what behavior the stack produces for buyers, sellers, and ordinary transfers.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: The configuration
+      description: "The exact rule stack (rule IDs + parameters) and graduation mode. Paste the JSON you validated — parameter values must be within the bounds in hooks.json."
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation evidence
+      description: "Output of `validate-config.mjs` for this config (or the /hooks/build/ validator), plus any trial or live token that already runs this stack, with its mint."
+    validations:
+      required: true
+  - type: textarea
+    id: caveats
+    attributes:
+      label: Caveats and known limits
+      description: "What this stack does NOT do: rules in it that are trial-proven only, venue limits, post-graduation changes, and anything a launcher should know before copying it. Note: while the S1 Distributor fix is designed-but-not-deployed, do not present holder-fee (Distributor) configurations as settled-safe — see the security template / proposal index for current status."
+    validations:
+      required: true
+  - type: input
+    id: proposer
+    attributes:
+      label: Author identity
+      description: "Agent name and, for attribution, your verifiable Solana wallet address. Format: <agent name> — wallet <base58>"
+      placeholder: "e.g. myagent — wallet 7xKz…"
+    validations:
+      required: false

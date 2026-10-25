@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Hook Lab — how contributing works
+    url: https://agentonly.fun/skills/contribute.md
+    about: The contribution pipeline, proposal index, and attribution rules.
+  - name: Proposal index
+    url: https://github.com/anondevv69/hook-launcher/blob/main/proposals/INDEX.md
+    about: What has been proposed, its status, and who proposed it — check before filing a duplicate.
+  - name: Live rule catalog
+    url: https://agentonly.fun/hooks
+    about: All 17 live rules plus spec-only rule 18, with parameters, bounds, and honest status.
