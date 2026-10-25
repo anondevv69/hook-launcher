@@ -133,9 +133,12 @@ const hasRule = (c, id) => c.rules.some(r => r.id === id && r.enabled !== false)
 // The engine generation a token runs is READ FROM ITS PUBLISHED META
 // LIST — the ground truth the resolver itself uses: a holder entry
 // seeded with AccountData (disc 4) means the v2 engine (owner-keyed
-// records; every token live today), an entry seeded with AccountKey
-// (disc 3) means the v3 engine (account-keyed records). No list (or no
-// holder entries) → v2, the only deployed generation.
+// records), an entry seeded with AccountKey (disc 3) means the v3
+// engine (account-keyed records). As of 2026-10-23 every live token's
+// list is AccountKey-templated (the v3 retrofit landed everywhere —
+// Phase 1 audit §1); the v2 branch remains for legacy/list-less
+// shapes and pre-retrofit records. No list (or no holder entries) →
+// v2 fallback.
 let _holderMode = null;
 async function holderMode(c) {
   if (_holderMode) return _holderMode;
@@ -368,6 +371,23 @@ const tokenRaw = async (c, owner) => {
 // ---------- commands ----------
 if (cmd === 'init') {
   if (fs.existsSync(KEY_PATH)) { console.log('Keypair already exists:', loadWallet().publicKey.toBase58()); process.exit(0); }
+  // Signer-capability preflight (notice, not a block): a fresh local
+  // keypair is ONE signer option — check first whether the agent
+  // already has a signer that can execute, so it does not create a
+  // second wallet by default. Full preflight: node trade.mjs wallet-check
+  console.log('Before creating a wallet — signer check:');
+  console.log('  `init` creates a NEW local keypair wallet. Anything you buy is held by THIS');
+  console.log('  wallet, custodied by the key file alone (mode 600 — back it up, never share it).');
+  console.log('  You do NOT need it if your signer can sign serialized Solana transactions');
+  console.log('  (hardware wallet, multisig, external signer): AgentOnly builds unsigned');
+  console.log('  transactions for that signer instead — see trade.mjs wallet-check / build.');
+  console.log('  A custodial wallet whose platform cannot sign arbitrary Solana transactions');
+  console.log('  (e.g. Bankr — its documented signing API is EVM-only) cannot register or trade');
+  console.log('  ruled tokens itself; a local keypair like this one is the supported workaround.');
+  console.log('  Sandbox agents: keep the key file in storage that persists across sessions and');
+  console.log('  verify this same address reads back in a later session before funding it');
+  console.log('  (persistence handshake) — a wallet that does not persist strands its funds.');
+  console.log('');
   const kp = Keypair.generate();
   fs.writeFileSync(KEY_PATH, JSON.stringify(Array.from(kp.secretKey)), { mode: 0o600 });
   console.log('Wallet created:', kp.publicKey.toBase58());

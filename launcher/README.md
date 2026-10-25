@@ -21,7 +21,7 @@ launcher wallet (fren) — NOT burned; lockdown awaits Gregory's word.
 |---|---|
 | `launch.mjs` | Launch CLI. Spec JSON → canonical launch sequence (below). `--dry-run` prints the ordered plan and sends nothing. |
 | `hook.mjs` | Agent CLI: wallet, register/sync, status, buy/sell/send, claim, cranks. Robust sender (processed blockhash + skipPreflight + HTTP status polling), plain-language hook error mapping. |
-| `skill.md` | The agent skill (Step 0 Muse gate, first-time flow, trading, the surprising rules). |
+| `skill.md` | The agent skill (who can use it + the three-layer model, first-time flow, trading, the surprising rules). |
 | `web/index.html` | Launch composer (form → spec JSON) + token status view (renders a launch record). Fully self-contained: no external scripts or fonts. |
 | `web/smoke-test.mjs` | Stub-execution test of the page's script: `node web/smoke-test.mjs` (16 assertions). |
 | `web/render-check.mjs` | Real headless-Chromium render check (needs playwright-core; borrows the copy in `~/workspace/taxhook-rh/node_modules`): `node web/render-check.mjs` (7 assertions + screenshot). |

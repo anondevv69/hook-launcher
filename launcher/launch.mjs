@@ -5,6 +5,11 @@
 //
 //   node launch.mjs <spec.json> --dry-run           print the ordered plan, send nothing
 //   node launch.mjs <spec.json> [--out record.json] execute the launch (needs --rpc + keypair)
+//   node launch.mjs <spec.json> --template agent|human [--dry-run]
+//                                                    merge a branch template (templates.mjs —
+//                                                    SPEC-AGENTONLY §7 Fork B defaults) UNDER the
+//                                                    spec's own fields before validating
+//   node launch.mjs --print-template agent|human   print a branch template as JSON and exit
 //
 // Env: LAUNCH_KEYPAIR (keypair JSON path, default ~/.launch_keypair.json)
 //      LAUNCH_RPC     (RPC endpoint; required unless --dry-run)
@@ -32,13 +37,16 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import zlib from 'zlib';
-import { createHash } from 'crypto';
+import { createHash, randomBytes, createPrivateKey, sign as cryptoSign } from 'crypto';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 process.on('uncaughtException', (e) => { console.error('launch error:', e.message); process.exit(1); });
 import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { getAssociatedTokenAddressSync, createAssociatedTokenAccountInstruction, createTransferCheckedInstruction, createTransferCheckedWithTransferHookInstruction, createSyncNativeInstruction, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { IMPLEMENTED_IDS } from './browser-src/rules.generated.mjs';
+import { buildBranchSpec, BRANCH_TEMPLATES } from './templates.mjs';
+import { LAUNCH_TAG_SECRET } from './browser-src/tag.mjs';
+import bs58 from 'bs58';
 import BN from 'bn.js';
 import {
   DynamicBondingCurveClient, buildCurve, TokenType, TokenDecimal,
@@ -299,10 +307,12 @@ function encodeParams(id, entry) {
 // ---------- per-config meta-list templating (engine Phase 2) ----------
 // Mirrors the engine's required_extras() classification (engine/src/lib.rs):
 // the published meta list carries exactly the extras the enabled rules need,
-// in canonical order. The two holder entries are the only ones seeded from
-// token-account DATA (the owner field) — they are what makes the generic
-// resolver throw TokenTransferHookAccountDataNotFound for first-time
-// buyers, so a stack with no holder state publishes a fully static list.
+// in canonical order. The two holder entries are seeded with AccountKey
+// templates (disc 3 — the token account's own key), so generic resolvers
+// CAN build a first buy for a fresh wallet. (The v2 shape seeded them
+// from token-account DATA — the owner field, disc 4 — which made the
+// generic resolver throw TokenTransferHookAccountDataNotFound for
+// first-time buyers; that shape is no longer published.)
 function requiredExtras(rules) {
   const has = (id) => rules.some(r => r.id === id && r.enabled !== false);
   const extras = [{ name: 'config', why: 'unconditional — Execute loads the config' }];
@@ -582,9 +592,16 @@ function resolveDevBuy(spec) {
 // ---------- token metadata (discovery fix, 2026-10-16) ----------
 // A launch's mint metadata URI is NEVER empty again. Pre-fix launches
 // (AGTR, Latch, HARVEST) were born with uri "" and stayed icon-less in
-// every index and bot directory until repaired by hand. Two sources:
+// every index and bot directory until repaired by hand. Three sources:
 //   "spec"      — spec.metadataUri, used verbatim (the operator hosts
 //                 their own metadata JSON; contents are their call).
+//   "service"   — the public metadata service (wallet-signed upload at
+//                 L0; see resolveMetadata / stageMetadata): any creator
+//                 can host metadata + image with their own launch
+//                 wallet — no operator, no site tree. Selected with
+//                 spec.metadataService (true = the default public
+//                 service, or a service base URL string) or env
+//                 LAUNCH_METADATA_SERVICE.
 //   "generated" — the launcher derives conventional site URLs from the
 //                 symbol: <base>/<slug>.json + <base>/<slug>.png, and
 //                 (CLI step L0) generates a default image + a metadata
@@ -598,6 +615,7 @@ function resolveDevBuy(spec) {
 // via env LAUNCH_METADATA_DIR (where files are staged) — the browser
 // composer derives the same URI and verifies it live before L2.
 const METADATA_BASE_DEFAULT = 'https://agentonly.fun/hooks';
+const METADATA_SERVICE_DEFAULT = 'https://metadata-production-b46e.up.railway.app';
 function metadataSlug(spec) {
   const s = String(spec.symbol ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   if (!s) throw new Error(`cannot derive a metadata slug from symbol ${JSON.stringify(spec.symbol)}`);
@@ -616,6 +634,27 @@ function resolveMetadata(spec) {
       source: 'spec', uri: String(spec.metadataUri), imageUri: spec.metadataImageUri ?? null,
       slug: null, jsonFile: null, pngFile: null,
       description: spec.description ?? null, externalUrl: null,
+    };
+  }
+  // "service" — the public metadata service: the creator's own wallet
+  // signs an upload at L0 (stageMetadata) and the service hosts the
+  // JSON + image. spec.metadataService: true = the default public
+  // service; a string = that service's base URL. Env
+  // LAUNCH_METADATA_SERVICE (a base URL) sets/overrides it when the
+  // spec doesn't. metadataUri (above) still wins when both are set.
+  // The final URLs come back in the upload response; uri here is the
+  // service's documented shape predicted from the slug, and imageUri
+  // stays null until the upload replaces both (stageMetadata).
+  const svcRaw = spec.metadataService ?? (process.env.LAUNCH_METADATA_SERVICE || null);
+  if (svcRaw != null && svcRaw !== false && svcRaw !== '') {
+    const slug = metadataSlug(spec);
+    const serviceBase = String(svcRaw === true ? METADATA_SERVICE_DEFAULT : svcRaw).replace(/\/+$/, '');
+    return {
+      source: 'service', slug, serviceBase,
+      uri: `${serviceBase}/meta/${slug}.json`,
+      imageUri: null,
+      jsonFile: null, pngFile: null,
+      description: spec.description ?? null, externalUrl: spec.metadataExternalUrl ?? null,
     };
   }
   const slug = metadataSlug(spec);
@@ -651,7 +690,7 @@ const PARTNER_IDENTITY = {
   logo: 'https://agentonly.fun/hooks/partner-logo.png',
 };
 function partnerIdentityText(feeClaimer) {
-  return `partner identity: "${PARTNER_IDENTITY.name}" (${PARTNER_IDENTITY.website}, logo ${PARTNER_IDENTITY.logo}) — in DBC a config hangs from a partner identity through its fee_claimer alone: the identity record is the partner-metadata account ${derivePartnerMetadata(feeClaimer).toBase58()} (PDA of the fee claimer in the DBC program; name/website/logo bound on-chain by createPartnerMetadata), and this config names fee_claimer=${feeClaimer.toBase58()}. A live launch verifies that account before L1: the launching wallet's own partner metadata is REQUIRED (refusal, never a silent anonymous launch); an operator-supplied fee claimer carries its own identity, or none`;
+  return `partner identity: whatever name/website/logo are bound in the fee claimer's OWN partner-metadata account (the platform's own record — "${PARTNER_IDENTITY.name}" (${PARTNER_IDENTITY.website}, logo ${PARTNER_IDENTITY.logo}) — is only the platform's example, bound to the platform wallet) — in DBC a config hangs from a partner identity through its fee_claimer alone: the identity record is the partner-metadata account ${derivePartnerMetadata(feeClaimer).toBase58()} (PDA of the fee claimer in the DBC program; name/website/logo bound on-chain by createPartnerMetadata), and this config names fee_claimer=${feeClaimer.toBase58()}. A live launch verifies that account before L1: the launching wallet's own partner metadata is REQUIRED (refusal, never a silent anonymous launch); an operator-supplied fee claimer carries its own identity, or none`;
 }
 
 function validateSpec(spec) {
@@ -669,11 +708,40 @@ function validateSpec(spec) {
     seen.add(id);
     encodeParams(id, entry); // validates params eagerly
   }
+  // Settlement split sum (Phase B cross-rule check, mirrored from the
+  // engine so the refusal happens HERE, at spec time — not at config
+  // write or, worse, at settlement): the Distributor carves each
+  // distribution by rules 5 (Crown Beneficiary, crownBps), 6 (Tithe
+  // Seat, titheBps) and 15 (King of the Pool, titheBps), and the three
+  // carves share one distribution. The engine rejects a config whose
+  // ENABLED carves sum over 10000 bps (engine/src/lib.rs split_sum —
+  // disabled entries are not summed), and the Distributor hard-errors
+  // the same condition at settlement time (DistError::SplitBpsTooLarge).
+  // Effective bps are the values encodeParams writes — defaults
+  // included (500 / 300 / 0) — and the loop above already encoded every
+  // entry, so the fields are known-valid integers here.
+  {
+    let splitSum = 0;
+    const parts = [];
+    for (const entry of rules) {
+      if (entry.enabled === false) continue;
+      const id = ruleIdOf(entry);
+      const bps = id === 5 ? (entry.crownBps ?? 500)
+        : id === 6 ? (entry.titheBps ?? 300)
+        : id === 15 ? (entry.titheBps ?? 0)
+        : null;
+      if (bps != null) { splitSum += bps; parts.push(`rule ${id} (${RULE_NAMES[id]}) ${bps} bps`); }
+    }
+    if (splitSum > 10000) {
+      throw new Error(`settlement split too large: the rules 5+6+15 carves sum to ${splitSum} bps (${parts.join(' + ')}) — over the 10000 bps a distribution has. The engine rejects this at config write and the Distributor hard-errors it at settlement (SplitBpsTooLarge); fix it in the spec instead: lower crownBps (rule 5), titheBps (rule 6) or titheBps (rule 15).`);
+    }
+  }
   if (seen.has(1)) warnings.push('rule 1 (Basis Latch) on DBC: the feed prices from the pool state via the engine CrankPriceDbc instruction (reads the pool sqrt_price). The first crank must land before the first buy, and the feed must be re-cranked within max_stale_secs of any gated transfer — the trade flow handles this; a stale feed fails closed (StalePrice). See engine BUILD-NOTES.');
   if (seen.has(8)) warnings.push('rule 8 (Holder-Gated) fails closed on DBC: curve swaps resolve only the meta list, and the gate sync must sit adjacent to the transfer. Rule-8 tokens trade through surfaces that prepend SyncGateBalance (the agent skill\'s `send`, the trade page) — plain curve buys of a rule-8 token will veto. See engine BUILD-NOTES.');
   if (seen.has(7) && String((rules.find(r => ruleIdOf(r) === 7) ?? {}).mode).toLowerCase() === 'p2p-only') warnings.push('rule 7 P2P-only: venue receives are vetoed — the DBC curve can be seeded but not bought from. This is a pure social-token posture; the curve will sit idle by design.');
   if (seen.has(17)) warnings.push('rule 17 (Ecosystem Gate): an ecosystem-gated token can only be received by wallets holding an attested registration for that ecosystem — until that ecosystem\'s attester is configured in the Registry and its enrollment flow runs, nobody can receive.');
-  resolveFees(spec); // creator-fee rate bounds + destination consistency (throws)
+  const feesCheck = resolveFees(spec); // creator-fee rate bounds + destination consistency (throws)
+  if (feesCheck.destination === 'holders') warnings.push('S1 NOTICE: fees-to-holders uses the Distributor, whose first-touch claim accounting has a known flaw (S1). A fix (Design D, proposals/S1-distributor-settle-on-transfer.md) is designed but NOT deployed. Do not treat a holder-fee launch as safe until that fix ships.');
   resolveDevBuy(spec); // bundled dev buy bounds (throws)
   const grad = resolveGraduation(spec); // graduation mode + threshold contradiction (throws)
   const houseF = resolveHouseFields(spec); // house launch fields (throws; null unless house)
@@ -985,7 +1053,7 @@ async function verifyMetadataLive(metadata, spec) {
   const res = await fetchWithRetry(metadata.uri);
   let doc;
   try { doc = await res.clone().json(); } catch { throw new Error(`metadata URI ${metadata.uri} did not return parseable JSON`); }
-  if (metadata.source === 'generated' && (doc.name !== spec.name || doc.symbol !== spec.symbol || doc.image !== metadata.imageUri)) {
+  if ((metadata.source === 'generated' || metadata.source === 'service') && (doc.name !== spec.name || doc.symbol !== spec.symbol || doc.image !== metadata.imageUri)) {
     throw new Error(`staged metadata JSON at ${metadata.uri} does not match this launch (name/symbol/image) — refusing to launch against it`);
   }
   const image = doc.image ?? null;
@@ -996,11 +1064,48 @@ async function verifyMetadataLive(metadata, spec) {
   }
   return image;
 }
+// ed25519 signing for the metadata service, via node:crypto
+// (tweetnacl is not a dependency of this package, and @solana/web3.js
+// Keypair exposes no sign()). A Solana secretKey is seed(32) ||
+// pubkey(32); the PKCS8 DER wrapper for an ed25519 seed is a fixed
+// 16-byte prefix + the seed. The service verifies the same way
+// (SPKI prefix + crypto verify) over the canonical message.
+function signMetadataMessage(keypair, message) {
+  const seed = Buffer.from(keypair.secretKey.slice(0, 32));
+  const der = Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]);
+  const key = createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
+  return cryptoSign(null, Buffer.from(message, 'utf8'), key);
+}
 async function stageMetadata(spec, metadata) {
   if (metadata.source === 'spec') {
     const image = await verifyMetadataLive(metadata, spec);
     console.log('ok L0 metadata (operator-supplied URI, verified live)', metadata.uri);
     return { source: 'spec', uri: metadata.uri, image, verified: true };
+  }
+  if (metadata.source === 'service') {
+    const serviceBase = metadata.serviceBase;
+    const imageBytes = spec.metadataImageFile
+      ? fs.readFileSync(spec.metadataImageFile)
+      : renderTokenPng(spec.symbol);
+    const wallet = launcher.publicKey.toBase58();
+    const symbolUpper = String(spec.symbol).toUpperCase();
+    const imageSha = createHash('sha256').update(imageBytes).digest('hex');
+    const nonce = randomBytes(8).toString('hex'); // 16 random hex chars
+    const message = `agentonly-meta:${wallet}:${symbolUpper}:${imageSha}:${nonce}`;
+    const signature = bs58.encode(signMetadataMessage(launcher, message));
+    const payload = { wallet, name: spec.name, symbol: symbolUpper, imageBase64: imageBytes.toString('base64'), nonce, signature };
+    if (spec.description != null) payload.description = spec.description;
+    if (spec.metadataExternalUrl != null) payload.externalUrl = spec.metadataExternalUrl;
+    const res = await fetch(`${serviceBase}/meta/upload`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`L0 metadata: metadata service upload failed (HTTP ${res.status}): ${text}`);
+    let out;
+    try { out = JSON.parse(text); } catch { throw new Error(`L0 metadata: metadata service returned non-JSON: ${text}`); }
+    metadata.uri = out.metadataUrl;
+    metadata.imageUri = out.imageUrl;
+    const image = await verifyMetadataLive(metadata, spec);
+    console.log(`ok L0 metadata (public metadata service, wallet-signed upload) — verified live: ${metadata.uri}`);
+    return { source: 'service', uri: metadata.uri, image, verified: true, service: { base: serviceBase, wallet } };
   }
   const hooksDir = process.env.LAUNCH_METADATA_DIR || path.join(os.homedir(), 'workspace', 'aonly-site', 'hooks');
   if (!fs.existsSync(hooksDir) || !fs.statSync(hooksDir).isDirectory()) {
@@ -1032,13 +1137,33 @@ async function stageMetadata(spec, metadata) {
 
 // ---------- args ----------
 const argv = process.argv.slice(2);
-const specPath = argv.find(a => !a.startsWith('--'));
+// --print-template <agent|human>: print a branch template (templates.mjs)
+// as JSON and exit — how a spec author starts from the platform defaults.
+const ptIdx = argv.indexOf('--print-template');
+if (ptIdx >= 0) {
+  const kind = String(argv[ptIdx + 1] ?? '').toLowerCase();
+  if (!BRANCH_TEMPLATES.hasOwnProperty(kind)) { console.error(`--print-template needs "agent" or "human", got ${JSON.stringify(argv[ptIdx + 1])}`); process.exit(1); }
+  console.log(JSON.stringify(BRANCH_TEMPLATES[kind], null, 2));
+  process.exit(0);
+}
+// --template <agent|human>: merge the branch template UNDER the spec
+// file's fields (the spec's explicit fields always win; see
+// templates.mjs). The template value token is consumed here so it is
+// never mistaken for the spec path.
+const tplIdx = argv.indexOf('--template');
+const templateKind = tplIdx >= 0 ? String(argv[tplIdx + 1] ?? '').toLowerCase() : null;
+if (tplIdx >= 0 && !BRANCH_TEMPLATES.hasOwnProperty(templateKind)) { console.error(`--template needs "agent" or "human", got ${JSON.stringify(argv[tplIdx + 1])}`); process.exit(1); }
+const consumedArgIdx = new Set();
+if (tplIdx >= 0) { consumedArgIdx.add(tplIdx); consumedArgIdx.add(tplIdx + 1); }
+const specPath = argv.find((a, i) => !a.startsWith('--') && !consumedArgIdx.has(i));
 const dryRun = argv.includes('--dry-run');
 const stageOnly = argv.includes('--stage-metadata');
 const outIdx = argv.indexOf('--out');
 const outPath = outIdx >= 0 ? argv[outIdx + 1] : null;
-if (!specPath) { console.error('Usage: node launch.mjs <spec.json> [--dry-run] [--out record.json]'); process.exit(1); }
-const spec = JSON.parse(fs.readFileSync(specPath, 'utf8'));
+if (!specPath) { console.error('Usage: node launch.mjs <spec.json> [--dry-run] [--out record.json] [--template agent|human] | node launch.mjs --print-template agent|human'); process.exit(1); }
+const specFileJson = JSON.parse(fs.readFileSync(specPath, 'utf8'));
+const spec = templateKind ? buildBranchSpec(templateKind, specFileJson) : specFileJson;
+if (templateKind) console.log(`template: ${templateKind} branch defaults merged under the spec's explicit fields (templates.mjs — SPEC-AGENTONLY §7 Fork B)`);
 const warnings = validateSpec(spec);
 
 const mode = MODES[String(spec.authorityMode ?? 'locked').toLowerCase()];
@@ -1064,10 +1189,25 @@ const guardPlanDecision = engineV4GuardDecision(spec, readFixedEngineSha(), null
 
 // Identities: in dry-run these are EPHEMERAL samples so predicted PDAs can be
 // printed; a real launch generates/persists its own (see record output).
-const launcher = (dryRun || stageOnly) ? Keypair.generate() : (() => {
+function loadLauncherKeypair() {
   const kpPath = process.env.LAUNCH_KEYPAIR || os.homedir() + '/.launch_keypair.json';
-  if (!fs.existsSync(kpPath)) { console.error(`No keypair at ${kpPath} — create one (mode 600) or set LAUNCH_KEYPAIR. Refusing to launch without a signer.`); process.exit(1); }
+  if (!fs.existsSync(kpPath)) return null;
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(kpPath, 'utf8'))));
+}
+const launcher = (() => {
+  if (dryRun) return Keypair.generate(); // plan only — nothing is signed
+  if (stageOnly) {
+    // Staging signs real artifacts (a metadata-service upload binds the
+    // symbol to the signing wallet), so prefer the real keypair when
+    // one is available; an ephemeral stage would orphan the symbol.
+    const real = loadLauncherKeypair();
+    if (real) return real;
+    console.warn('WARNING: --stage-metadata with no launcher keypair available (LAUNCH_KEYPAIR / ~/.launch_keypair.json) — using an EPHEMERAL keypair. A metadata-service upload will bind the symbol to this throwaway wallet and cannot be re-uploaded by your real wallet. Set LAUNCH_KEYPAIR before staging if the spec uses the metadata service.');
+    return Keypair.generate();
+  }
+  const kp = loadLauncherKeypair();
+  if (!kp) { console.error(`No keypair at ${process.env.LAUNCH_KEYPAIR || os.homedir() + '/.launch_keypair.json'} — create one (mode 600) or set LAUNCH_KEYPAIR. Refusing to launch without a signer.`); process.exit(1); }
+  return kp;
 })();
 const authority = spec.authority ? new PublicKey(spec.authority) : launcher.publicKey;
 const feeClaimer = spec.feeClaimer ? new PublicKey(spec.feeClaimer) : launcher.publicKey;
@@ -1079,15 +1219,25 @@ if (fees.destination === 'holders' && !feeClaimer.equals(launcher.publicKey)) {
   console.error('feeDestination "holders" requires feeClaimer to be the launching wallet — it performs the claim -> convert -> route duty (hook.mjs claim-fees). Use the launcher as feeClaimer or set feeDestination "creator".');
   process.exit(1);
 }
-// Launch signer keypair (Feature A): loaded from the deploy tree; its
+// Launch signer keypair (Feature A) — three-tier resolution; its
 // secret never leaves this process (never printed, never recorded —
-// only its pubkey appears in plan/record output). A live launch REQUIRES
-// the file; a dry run falls back to an ephemeral sample so the plan can
-// still show the tag shape offline.
+// only its pubkey appears in plan/record output):
+//   (1) deploy/launcher-tag.json, when present — the operator path
+//       (the build tree keeps the canonical file there, mode 600);
+//   (2) the bundled browser-src/tag.mjs LAUNCH_TAG_SECRET — the SAME
+//       keypair, embedded publicly BY DESIGN (see that file's header):
+//       the tag key is fundless and powerless — it holds nothing, owns
+//       nothing, and can only co-sign a launch's creation transactions
+//       read-only — so publishing it is safe: the worst case is spoofed
+//       tags, never funds at risk. This tier is what lets an outside
+//       checkout tag its launches identically to the platform's.
+//   (3) a stripped tree with neither: an ephemeral sample for dry runs
+//       (plan shape only) and a hard refusal for live runs.
 const TAG_KEYPAIR_PATH = new URL('../deploy/launcher-tag.json', import.meta.url).pathname;
 const tagKeypair = (() => {
   if (fs.existsSync(TAG_KEYPAIR_PATH)) return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(TAG_KEYPAIR_PATH, 'utf8'))));
-  if (!dryRun && !stageOnly) { console.error(`No launch signer keypair at ${TAG_KEYPAIR_PATH} — every live launch's creation transactions carry the launch signer (Feature A). Refusing to launch untagged.`); process.exit(1); }
+  if (Array.isArray(LAUNCH_TAG_SECRET) && LAUNCH_TAG_SECRET.length === 64) return Keypair.fromSecretKey(Uint8Array.from(LAUNCH_TAG_SECRET));
+  if (!dryRun && !stageOnly) { console.error(`No launch signer keypair at ${TAG_KEYPAIR_PATH} and no bundled tag key (browser-src/tag.mjs) — every live launch's creation transactions carry the launch signer (Feature A). Refusing to launch untagged.`); process.exit(1); }
   return Keypair.generate();
 })();
 // LAUNCH_SIGNER — the platform launch signer: the constant public
@@ -1161,9 +1311,11 @@ const budgetSol =
   rentVaultSol + (spec.seedSol ?? 0) + (devBuy ? devBuy.sol : 0) + houseBudgetSol;
 
 const plan = [];
-plan.push(['L0', 'token metadata — generated, hosted, verified BEFORE the pool exists (never an empty URI)', 'static hosting at agentonly.fun (site deploy) + live fetch verification', metadata.source === 'spec'
+plan.push(['L0', 'token metadata — generated, hosted, verified BEFORE the pool exists (never an empty URI)', metadata.source === 'service' ? 'public metadata service (wallet-signed upload) + live fetch verification' : 'static hosting at agentonly.fun (site deploy) + live fetch verification', metadata.source === 'spec'
   ? `operator-supplied metadataUri used verbatim: ${metadata.uri} — a live run fetches it first and refuses to launch if it does not resolve to parseable JSON (contents are the operator's responsibility)`
-  : `launcher generates ${metadata.pngFile} (512×512 generated monogram in the site palette; override with spec.metadataImageUri) + ${metadata.jsonFile} (name/symbol/description/image, the HARVEST repair shape) into the site tree, deploys the site, and verifies ${metadata.uri} and ${metadata.imageUri} live (200, JSON parses, image is an image) before L1; uri written at L2 = ${metadata.uri}; description: "${metadata.description}"`]);
+  : metadata.source === 'service'
+    ? `launcher uploads the token image (spec.metadataImageFile, or a generated 512×512 monogram) + name/symbol/description to the public metadata service at ${metadata.serviceBase}, signed with the launcher wallet (the upload binds the symbol to that wallet), and verifies the hosted JSON live before L1; predicted uri written at L2 = ${metadata.uri} (the upload response's metadataUrl replaces it at staging time)`
+    : `launcher generates ${metadata.pngFile} (512×512 generated monogram in the site palette; override with spec.metadataImageUri) + ${metadata.jsonFile} (name/symbol/description/image, the HARVEST repair shape) into the site tree, deploys the site, and verifies ${metadata.uri} and ${metadata.imageUri} live (200, JSON parses, image is an image) before L1; uri written at L2 = ${metadata.uri}; description: "${metadata.description}"`]);
 const migrationDesc = graduation.mode === 'never'
   ? `migration threshold ${NEVER_THRESHOLD_SOL} SOL (u64::MAX lamports — set to never complete; this token never migrates)`
   : graduation.mode === 'house'
@@ -1276,9 +1428,9 @@ let partnerIdentityRecord = null;
     partnerIdentityRecord = { name: md.name, website: md.website, logo: md.logo, metadataAccount: derivePartnerMetadata(feeClaimer).toBase58(), feeClaimer: feeClaimer.toBase58() };
     console.log('ok L1 partner identity', JSON.stringify(md.name), '— metadata account', partnerIdentityRecord.metadataAccount, 'for fee_claimer', feeClaimer.toBase58());
   } else if (feeClaimer.equals(launcher.publicKey)) {
-    throw new Error(`partner identity missing: no partner-metadata account for the launcher wallet ${feeClaimer.toBase58()} — refusing to launch a config that would index as anonymous DBC flow. Create the identity once: node create-partner-metadata.mjs write (name "${PARTNER_IDENTITY.name}")`);
+    throw new Error(`partner identity missing: no partner-metadata account for the launcher wallet ${feeClaimer.toBase58()} — refusing to launch a config that would index as anonymous DBC flow. Create your own identity once: node create-partner-metadata.mjs write with PARTNER_NAME / PARTNER_WEBSITE / PARTNER_LOGO set to your own values`);
   } else {
-    console.warn(`WARNING: fee_claimer ${feeClaimer.toBase58()} has no DBC partner-metadata account — this launch carries no partner identity and will index as anonymous DBC flow. (The launcher's own identity, "${PARTNER_IDENTITY.name}", attaches only when the fee claimer is the launcher wallet.)`);
+    console.warn(`WARNING: fee_claimer ${feeClaimer.toBase58()} has no DBC partner-metadata account — this launch carries no partner identity and will index as anonymous DBC flow. (The platform identity "${PARTNER_IDENTITY.name}" attaches only when the fee claimer is the platform wallet; any other claimer carries its own identity or none.)`);
   }
 }
 {

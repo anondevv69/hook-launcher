@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "name": "Agent Reserve",
+  "symbol": "AGTR",
+  "decimals": 6,
+  "launchedAt": "2026-10-16T00:03:55.835Z",
+  "rpc": "https://api.mainnet-beta.solana.com",
+  "spec": {
+    "authorityMode": "locked",
+    "decimals": 6,
+    "holderFees": {
+      "callerCutBps": 100,
+      "enabled": true
+    },
+    "migrationThresholdSol": 42,
+    "name": "Agent Reserve",
+    "rentVaultSol": 0.05,
+    "rules": [
+      {
+        "id": 3
+      },
+      {
+        "capBps": 500,
+        "id": 9
+      }
+    ],
+    "seedSol": 0,
+    "supply": 1000000000,
+    "symbol": "AGTR"
+  },
+  "programs": {
+    "engine": "EPdYVfsX7Lk9gtLp8CVouiFrNwtxP5g11NR6DDgs6akT",
+    "registry": "GftZenfbCBwiTKqui3D67mkgofB5wkgAyzRxBEPiwL2e",
+    "distributor": "DpRjnQiywdJTUSWBvsJ1vj2mdvvCEDFzAStZJtL1tCQa",
+    "dbc": "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",
+    "token2022": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+  },
+  "addresses": {
+    "launcher": "FMYVMuJgoM9J41PaXBmJe6ijSHUtSr2VPRbAJvH4MhCP",
+    "authority": "FMYVMuJgoM9J41PaXBmJe6ijSHUtSr2VPRbAJvH4MhCP",
+    "feeClaimer": "FMYVMuJgoM9J41PaXBmJe6ijSHUtSr2VPRbAJvH4MhCP",
+    "dbcConfig": "4kphMeeYEz4UKbm8BKDaJUBN4gVLdCmZ1FU3f2GctX7h",
+    "mint": "Hfk7uqxZ3fFB4TpAzSKYGCJ3uuAJ1E1fk6i6vSn3FVXR",
+    "pool": "9NsjhhDoXRYds8q8uLHWBN38iFab38nA4VAkyLtvYVV7",
+    "poolAuthority": "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM",
+    "baseVault": "8BG1AdnVLsmzMM8PtSz2RPCxDwFgfwnbo5kPXYEQoMKK",
+    "quoteVault": "4FPfKLvKTn6n4aRbqLmQDykLTYGqGd1UPG8LXcUXTqZ5",
+    "engineConfig": "4Tt9Sq6SciFoAAy6cUyYdsVGDjADLS4foSSvGGGWdnS7",
+    "metaList": "8h8jiSYudjbTacKWGjbmQtQX6QmyTVP9yUKKpSA586AV",
+    "priceFeed": null,
+    "rentVault": "BcktSWQtBiZ9pPRfofP47qCN5DaKV6iYd8gY3NZ7uUZ9",
+    "distributor": {
+      "state": "cexMThLhJJgXnrxMY8ua8F1gTbLfGnoyGhwUVogbKkS",
+      "vault": "6LeucGfr2GBpCACQEJbCTjsAUnt2uwFLjHSBRKmjc5FA",
+      "callerCutBps": 100,
+      "fundingMode": "auto (DBC mint → 1, routed)",
+      "routingTarget": "6LeucGfr2GBpCACQEJbCTjsAUnt2uwFLjHSBRKmjc5FA"
+    }
+  },
+  "rules": [
+    {
+      "id": 3,
+      "name": "Agent-Only",
+      "enabled": true,
+      "params": {
+        "id": 3
+      }
+    },
+    {
+      "id": 9,
+      "name": "Max Wallet",
+      "enabled": true,
+      "params": {
+        "capBps": 500,
+        "id": 9
+      }
+    }
+  ],
+  "authorityMode": "locked",
+  "signatures": {
+    "dbcConfig": "2S2qD7L2UzsRqNtT6URK8v3XG7kUndZCY2tVWjxVC5utCb7Ur5hgAx8cNy2SgoboquQC2fmx52BSsohPxZtQXzGR",
+    "dbcPool": "36dJVzUpbutMQYEGcUZzbPiEeS1QhmqHYsD6NrUxN6w4x2W3KDE5BJyJhs6iat7bCijMfa2doid8ymMKPcYQuvq6",
+    "engineConfig": "4uLmQfgFfSvkbkmDqr82T8UDKLo5q39neB87C6x727XfqF1U8RAfT1yMAD8XRyds7mYTdCspc89jEreXYix8NVB3",
+    "engineMetas": "2KizAENSTYE1MzomNq8kyx9PkbxLfz9dQVu3uCo8DgGaT8yUjhSPGH5Z2sNfvfnUpNUk1BfxwQeeCrUdDFFZgYL9",
+    "rentVault": "5qmmrQftzv2sXx1SAm7Q83BD6FN4FJJT9Ea4S4rpDWo8KuQpVCxr27UNYUDCC93KCDR4oWAz4Gvz4xQVVudhBGZU",
+    "distributor": "4y4ZzW6fxV7fikNEShmBg3LpccasKw7mywNKTpaCkRK7m2jex4NrGZFiTf8KJLaK6p1ioMqpo6VxNcuvjKwF5hxv"
+  }
+}
