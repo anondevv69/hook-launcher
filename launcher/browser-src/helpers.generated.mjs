@@ -259,10 +259,12 @@ function encodeParams(id, entry) {
 // ---------- per-config meta-list templating (engine Phase 2) ----------
 // Mirrors the engine's required_extras() classification (engine/src/lib.rs):
 // the published meta list carries exactly the extras the enabled rules need,
-// in canonical order. The two holder entries are the only ones seeded from
-// token-account DATA (the owner field) — they are what makes the generic
-// resolver throw TokenTransferHookAccountDataNotFound for first-time
-// buyers, so a stack with no holder state publishes a fully static list.
+// in canonical order. The two holder entries are seeded with AccountKey
+// templates (disc 3 — the token account's own key), so generic resolvers
+// CAN build a first buy for a fresh wallet. (The v2 shape seeded them
+// from token-account DATA — the owner field, disc 4 — which made the
+// generic resolver throw TokenTransferHookAccountDataNotFound for
+// first-time buyers; that shape is no longer published.)
 function requiredExtras(rules) {
   const has = (id) => rules.some(r => r.id === id && r.enabled !== false);
   const extras = [{ name: 'config', why: 'unconditional — Execute loads the config' }];
@@ -542,9 +544,16 @@ function resolveDevBuy(spec) {
 // ---------- token metadata (discovery fix, 2026-10-16) ----------
 // A launch's mint metadata URI is NEVER empty again. Pre-fix launches
 // (AGTR, Latch, HARVEST) were born with uri "" and stayed icon-less in
-// every index and bot directory until repaired by hand. Two sources:
+// every index and bot directory until repaired by hand. Three sources:
 //   "spec"      — spec.metadataUri, used verbatim (the operator hosts
 //                 their own metadata JSON; contents are their call).
+//   "service"   — the public metadata service (wallet-signed upload at
+//                 L0; see resolveMetadata / stageMetadata): any creator
+//                 can host metadata + image with their own launch
+//                 wallet — no operator, no site tree. Selected with
+//                 spec.metadataService (true = the default public
+//                 service, or a service base URL string) or env
+//                 LAUNCH_METADATA_SERVICE.
 //   "generated" — the launcher derives conventional site URLs from the
 //                 symbol: <base>/<slug>.json + <base>/<slug>.png, and
 //                 (CLI step L0) generates a default image + a metadata
@@ -558,6 +567,7 @@ function resolveDevBuy(spec) {
 // via env LAUNCH_METADATA_DIR (where files are staged) — the browser
 // composer derives the same URI and verifies it live before L2.
 const METADATA_BASE_DEFAULT = 'https://agentonly.fun/hooks';
+const METADATA_SERVICE_DEFAULT = 'https://metadata-production-b46e.up.railway.app';
 function metadataSlug(spec) {
   const s = String(spec.symbol ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   if (!s) throw new Error(`cannot derive a metadata slug from symbol ${JSON.stringify(spec.symbol)}`);
@@ -576,6 +586,27 @@ function resolveMetadata(spec) {
       source: 'spec', uri: String(spec.metadataUri), imageUri: spec.metadataImageUri ?? null,
       slug: null, jsonFile: null, pngFile: null,
       description: spec.description ?? null, externalUrl: null,
+    };
+  }
+  // "service" — the public metadata service: the creator's own wallet
+  // signs an upload at L0 (stageMetadata) and the service hosts the
+  // JSON + image. spec.metadataService: true = the default public
+  // service; a string = that service's base URL. Env
+  // LAUNCH_METADATA_SERVICE (a base URL) sets/overrides it when the
+  // spec doesn't. metadataUri (above) still wins when both are set.
+  // The final URLs come back in the upload response; uri here is the
+  // service's documented shape predicted from the slug, and imageUri
+  // stays null until the upload replaces both (stageMetadata).
+  const svcRaw = spec.metadataService ?? (process.env.LAUNCH_METADATA_SERVICE || null);
+  if (svcRaw != null && svcRaw !== false && svcRaw !== '') {
+    const slug = metadataSlug(spec);
+    const serviceBase = String(svcRaw === true ? METADATA_SERVICE_DEFAULT : svcRaw).replace(/\/+$/, '');
+    return {
+      source: 'service', slug, serviceBase,
+      uri: `${serviceBase}/meta/${slug}.json`,
+      imageUri: null,
+      jsonFile: null, pngFile: null,
+      description: spec.description ?? null, externalUrl: spec.metadataExternalUrl ?? null,
     };
   }
   const slug = metadataSlug(spec);
@@ -611,7 +642,7 @@ const PARTNER_IDENTITY = {
   logo: 'https://agentonly.fun/hooks/partner-logo.png',
 };
 function partnerIdentityText(feeClaimer) {
-  return `partner identity: "${PARTNER_IDENTITY.name}" (${PARTNER_IDENTITY.website}, logo ${PARTNER_IDENTITY.logo}) — in DBC a config hangs from a partner identity through its fee_claimer alone: the identity record is the partner-metadata account ${derivePartnerMetadata(feeClaimer).toBase58()} (PDA of the fee claimer in the DBC program; name/website/logo bound on-chain by createPartnerMetadata), and this config names fee_claimer=${feeClaimer.toBase58()}. A live launch verifies that account before L1: the launching wallet's own partner metadata is REQUIRED (refusal, never a silent anonymous launch); an operator-supplied fee claimer carries its own identity, or none`;
+  return `partner identity: whatever name/website/logo are bound in the fee claimer's OWN partner-metadata account (the platform's own record — "${PARTNER_IDENTITY.name}" (${PARTNER_IDENTITY.website}, logo ${PARTNER_IDENTITY.logo}) — is only the platform's example, bound to the platform wallet) — in DBC a config hangs from a partner identity through its fee_claimer alone: the identity record is the partner-metadata account ${derivePartnerMetadata(feeClaimer).toBase58()} (PDA of the fee claimer in the DBC program; name/website/logo bound on-chain by createPartnerMetadata), and this config names fee_claimer=${feeClaimer.toBase58()}. A live launch verifies that account before L1: the launching wallet's own partner metadata is REQUIRED (refusal, never a silent anonymous launch); an operator-supplied fee claimer carries its own identity, or none`;
 }
 
 function validateSpec(spec) {
@@ -661,7 +692,8 @@ function validateSpec(spec) {
   if (seen.has(8)) warnings.push('rule 8 (Holder-Gated) fails closed on DBC: curve swaps resolve only the meta list, and the gate sync must sit adjacent to the transfer. Rule-8 tokens trade through surfaces that prepend SyncGateBalance (the agent skill\'s `send`, the trade page) — plain curve buys of a rule-8 token will veto. See engine BUILD-NOTES.');
   if (seen.has(7) && String((rules.find(r => ruleIdOf(r) === 7) ?? {}).mode).toLowerCase() === 'p2p-only') warnings.push('rule 7 P2P-only: venue receives are vetoed — the DBC curve can be seeded but not bought from. This is a pure social-token posture; the curve will sit idle by design.');
   if (seen.has(17)) warnings.push('rule 17 (Ecosystem Gate): an ecosystem-gated token can only be received by wallets holding an attested registration for that ecosystem — until that ecosystem\'s attester is configured in the Registry and its enrollment flow runs, nobody can receive.');
-  resolveFees(spec); // creator-fee rate bounds + destination consistency (throws)
+  const feesCheck = resolveFees(spec); // creator-fee rate bounds + destination consistency (throws)
+  if (feesCheck.destination === 'holders') warnings.push('S1 NOTICE: fees-to-holders uses the Distributor, whose first-touch claim accounting has a known flaw (S1). A fix (Design D, proposals/S1-distributor-settle-on-transfer.md) is designed but NOT deployed. Do not treat a holder-fee launch as safe until that fix ships.');
   resolveDevBuy(spec); // bundled dev buy bounds (throws)
   const grad = resolveGraduation(spec); // graduation mode + threshold contradiction (throws)
   const houseF = resolveHouseFields(spec); // house launch fields (throws; null unless house)
