@@ -102,6 +102,14 @@ mint and the same holder records).
   the canonical one.
 - `specs/` — design specs, including the router-compat findings and
   the graduation/house contracts.
+- `proposals/` — the Hook Lab proposal index: every proposed rule,
+  recipe, or security fix, its status (`proposed`, `in review`,
+  `trial-proven`, `deployed`, `rejected`), and its attribution
+  record. Start at `proposals/INDEX.md`.
+- `CONTRIBUTING.md` — how a hook is proposed, specced, implemented,
+  and trial-proven, and the hard rule that external code never
+  upgrades mainnet contracts automatically. Templates for issues and
+  hook-implementation PRs live in `.github/`.
 - `verification/` — the trial battery (LiteSVM suites run against
   the real Meteora DBC binaries) and the on-chain proof scripts.
 - `deploy-records/` — the public deploy receipts: what was sent,

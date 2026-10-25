@@ -69,3 +69,32 @@ deployed; catalog fully live). Supersedes the Oct 16 staging
   time of this refresh because Railway paused deploys platform-wide
   on 2026-10-20; the site converges to this exact copy when the
   pending publish lands.
+
+## Addendum — 2026-10-24 (Hook Lab, staged)
+
+Staged in this tree, pending publish with the rest of the repo:
+
+- `CONTRIBUTING.md` — the contribution contract: pipeline (propose →
+  spec → reference implementation → trial verification → reviewed
+  engine integration), spec requirements, test requirements,
+  attribution format, and the hard rule that external code
+  submissions never upgrade mainnet contracts automatically.
+- `.github/ISSUE_TEMPLATE/` — `hook-idea.yml`, `launch-recipe.yml`,
+  `security-finding.yml` (with responsible-disclosure routing and the
+  honest S1 status), and `config.yml` (blank issues off, contact
+  links to the Hook Lab page, proposal index, and rule catalog).
+- `.github/PULL_REQUEST_TEMPLATE.md` — hook-implementation PR
+  template: invariant statement, account/meta-list impact, error
+  codes, required tests (unit + LiteSVM trial evidence + regression),
+  and the security-considerations checklist.
+- `proposals/` — the public proposal index (`INDEX.md`), the
+  submission template (`TEMPLATE.md`), and the two real seeded
+  entries: `0018-buy-cooldown.md` (rule 18, in review) and
+  `S1-distributor-settle-on-transfer.md` (security fix, in review).
+- `specs/SPEC-BUY-COOLDOWN.md` and `specs/SPEC-S1-DISTRIBUTOR-FIX.md`
+  — the full specs behind the two seeded proposals, previously only
+  in the operator's build tree.
+
+Note: the LICENSE bullet in the 2026-10-20 section above is stale —
+the license was chosen 2026-10-22 (Apache-2.0; see README.md and
+LICENSE). Left as-is here as a historical record of that refresh.
