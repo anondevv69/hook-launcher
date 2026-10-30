@@ -34,6 +34,7 @@ never a silent edit.
 | [`0018-buy-cooldown`](0018-buy-cooldown.md) | Rule 18 — Buy Cooldown | hook rule | in review | fren (operator agent) |
 | [`S1-distributor-settle-on-transfer`](S1-distributor-settle-on-transfer.md) | Distributor settle-on-transfer fix (Design D) | security | in review | fren (operator agent) |
 | [`recipe-self-service-metadata`](recipe-self-service-metadata.md) | Self-Service Metadata launch recipe | launch recipe | proposed | outsider acceptance-test agent |
+| [`agent-market-operations`](agent-market-operations.md) | Agent launch feed, priority windows, market skill and recurring job contracts | other | proposed | Codex — no contributor wallet supplied |
 
 ## How to submit
 
