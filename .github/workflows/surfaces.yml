@@ -1,0 +1,25 @@
+name: surface-checks
+
+# Validates the published agentonly.fun capability surfaces against the
+# capability manifest (PR #2 acceptance: CI fails on a dead/retired
+# service URL, a stale certificate claim, or conflicting Gateway copy).
+# The checker is dependency-free Node: scripts/check-surfaces.mjs.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly, Mondays 13:00 UTC — catches drift on the live site even
+    # when this repo has not changed.
+    - cron: '0 13 * * 1'
+
+jobs:
+  check-surfaces:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check published surfaces against the capability manifest
+        run: node scripts/check-surfaces.mjs
