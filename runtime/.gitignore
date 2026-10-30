@@ -1,0 +1,6 @@
+node_modules/
+# keys and approval artifacts — never committed, never shared
+*.keypair.json
+*.agentonly.json
+approval-card.json
+test-keys/
