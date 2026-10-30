@@ -17,11 +17,12 @@ and signs locally only when the owner approves that exact card.
 
 ```
 inspect ─► eligibility ─► quote ─► build (gateway-simulated)
-        ─► intent decoded from the build bytes and VALIDATED
+        ─► intent decoded from the build bytes, VALIDATED, and every
+           instruction CLASSIFIED into the approved trade shape
         ─► ONE approval card ─► owner approves the card fingerprint
         ─► sign locally (or via the external signer adapter)
         ─► MANDATORY simulation of the exact signed bytes (sigVerify),
-           with the wallet's SOL/token deltas enforced against the card
+           with FULL-EFFECT accounting over every writable account
         ─► broadcast ─► confirm against the CARD's blockhash window
         ─► receipt (before/after balances)
 ```
@@ -50,9 +51,14 @@ time the runtime decodes the gateway build's actual bytes — legacy and
 versioned transactions, with address lookup tables resolved through the
 connection — into a normalized **intent**: fee payer, required signers,
 per-instruction program + kind summary, writable accounts, blockhash.
-It then validates that intent against the request, the build response,
-and the token's canonical record
-(`https://agentonly.fun/api/v1/tokens/<mint>.json`):
+(Version detection parses the message header *after* the signature
+shortvec — a serialized transaction starts with a signature count, not
+the version flag.) It then validates that intent against the request,
+the build response, and the token's canonical record
+(`https://agentonly.fun/api/v1/tokens/<mint>.json`). The canonical
+record is load-bearing: if it cannot be fetched, prepare **and** send
+refuse with `CANONICAL_DATA_UNAVAILABLE` — pool validation is never
+skipped.
 
 - fee payer must equal the selected wallet, and the required signers
   must be exactly `{wallet}` — no co-signers, no substituted payer;
@@ -72,6 +78,20 @@ and the token's canonical record
 - the build response must agree with its own bytes (blockhash, raw
   `amount_in`) or prepare refuses.
 
+**Allowlisting is not enough — every instruction must also classify
+into the exact trade shape.** A build could pass a program allowlist
+while bundling a legitimate swap with an extra transfer, so each
+decoded instruction is classified: ComputeBudget limit/heap settings,
+Memo, platform (engine/registry/distributor) instructions, the quoted
+venue's swap instruction, creation of the wallet's *own* ATA for the
+card mint, a System SOL transfer that is exactly the wallet↔pool leg
+(buy: wallet→pool, sell: pool→wallet), and token
+Transfer/TransferChecked instructions only between the wallet's
+account for the card mint and the pool's vault. Anything else — a
+System transfer to any other destination, a token instruction touching
+a different mint, a MintTo, an unclassifiable instruction on an
+allowlisted program — refuses with `UNCLASSIFIED_INSTRUCTION`.
+
 At **send** time the intent is re-derived from the card's bytes and
 deep-compared with the intent stored on the card, and every displayed
 field (amount, minimum out, bounds, blockhash) is cross-checked against
@@ -84,36 +104,44 @@ rendering of what was decoded and checked. A summary is not the rules
 and not a proof — the enforcement is the re-derivation at send time,
 not the text on the card.
 
-## Economic bounds, enforced from the signed-byte simulation
+## Full-effect accounting, enforced from the signed-byte simulation
 
 Signing is never the last check. After signing, the runtime **always**
 simulates the exact signed bytes (`sigVerify: true`), on both the
 dry-run and the broadcast path; any error refuses with
 `SIMULATION_FAILED` and the transaction is never broadcast. The
-simulation is requested with the wallet's accounts attached, so the
-runtime can compare pre-state against post-simulation state and enforce
-the card's bounds:
+simulation is requested with **every writable account the transaction
+touches** (plus the fee payer and the canonical pool set) attached, so
+the runtime can compare pre-state against post-simulation state for
+*all* of them — not just the wallet's own accounts:
 
-- the wallet's SOL debit must not exceed `maxSolDebitLamports` — the
-  trade amount plus an explicit **fee ceiling** (`feeCeilingLamports`,
-  set at prepare with `--max-fee-lamports`, default 5000000). The
-  ceiling covers the network fee and any rent for bundled prerequisites
-  (e.g. a registration build's accounts); if a legitimate build needs
-  more, prepare refuses at send time and the owner re-prepares with a
-  higher explicit ceiling — the bound is never silently widened;
-- a buy must credit at least the card's minimum-out of the token;
-- a sell must debit the full approved token amount and credit at least
-  minimum-out minus the fee ceiling.
+- **Aggregate bounds on the wallet:** the SOL debit must not exceed
+  `maxSolDebitLamports` — the trade amount plus an explicit **fee
+  ceiling** (`feeCeilingLamports`, set at prepare with
+  `--max-fee-lamports`, default 5000000). The bound is never silently
+  widened; a buy must credit at least the card's minimum-out of the
+  token; a sell must debit the full approved token amount and credit
+  at least minimum-out minus the fee ceiling.
+- **Permitted effects only:** the only accounts whose lamport or token
+  balances may change are (i) the wallet, (ii) the canonical pool
+  accounts (the pool and its vaults from the token record), and
+  (iii) the wallet's own token accounts for the card mint (including
+  ATA-creation rent arriving in a newly created own ATA). **Any other
+  account changing balance, in either direction, refuses with
+  `UNEXPECTED_EFFECT`.** The pool side must also behave like the
+  counterparty: it cannot gain the token on a buy, cannot receive more
+  SOL than the approved input, cannot pay out beyond the expected
+  proceeds plus the fee ceiling on a sell.
+- **Fail closed on state:** if the simulation returns missing,
+  partial, or malformed account states — an expected account absent,
+  an entry truncated, token data that does not decode — the send
+  refuses with `SIMULATION_STATE_MISSING`. There is no pass-through:
+  delta verification is mandatory, not best-effort.
 
 Confirmation then uses the **card's own** blockhash strategy —
 `confirmTransaction({signature, blockhash: card.blockhash,
 lastValidBlockHeight: card.lastValidBlockHeight})` — never a freshly
 fetched blockhash, which would let an expired build ride a new window.
-
-If a simulation ever returns no account states, the send proceeds only
-with the result explicitly marked `economicBounds: 'unverifiable — …'`
-(and a warning on the CLI): the bounds are disclosed as unchecked
-rather than quietly assumed.
 
 ## Install & run
 
@@ -184,7 +212,7 @@ sells) are all rejected with `INVALID_AMOUNT` before any network call.
 |---|---|
 | `own` — a local keypair file you control (Path A) | supported |
 | `sandbox` — a sandbox keypair (Path B′) | supported — attest its persistence before funding it |
-| `external` — an external signer command (protocol below) | supported — wire-equivalent to Path A; returned bytes are validated before use |
+| `external` — an external signer executable (protocol below) | supported — wire-equivalent to Path A; spawned without a shell; returned bytes are validated before use |
 | `bankr`, `custodial` — custodial / EVM-only wallets | **refused up front** with `TK_SIGNER_UNSUPPORTED`: the unsupported step is *arbitrary Solana instruction signing* (e.g. Bankr's documented signing surface is `personal_sign`, `eth_signTypedData_v4`, `eth_signTransaction` — all EVM). The refusal names the working alternative: an agent-controlled Solana signer. |
 
 This mirrors the gateway's own verdict — a Bankr wallet gets the same
@@ -196,14 +224,25 @@ refusal from `/v1/trade/build`, by name, before any spending path.
 agentonly-runtime prepare --signer-type external --wallet <address> \
   --mint <mint> --side buy --amount 0.05
 agentonly-runtime send --signer-type external \
-  --external-signer "<command>" --wallet <address> \
+  --external-signer <executable-path> \
+  [--external-signer-arg <value> ...] \
+  --wallet <address> \
   --card ./approval-card.json --approve <fingerprint> [--dry-run]
 ```
 
 No local keypair is involved. In this mode `prepare` only needs the
-wallet address (it never signs). At send time the runtime:
+wallet address (it never signs). `--external-signer` names a **trusted
+executable path** — a single plain path with no spaces or shell
+metacharacters, which must exist and be executable (anything else
+refuses with `EXTERNAL_SIGNER_INVALID` before any spawn). Arguments
+are passed as structured argv via repeatable `--external-signer-arg`
+flags. The runtime spawns the executable directly with `shell: false`
+— **there is no shell anywhere in this path**, so signer text can
+never become shell syntax. (To run a script, name your interpreter,
+e.g. `--external-signer /usr/bin/node --external-signer-arg signer.mjs
+--external-signer-arg keypair.json`.) At send time the runtime:
 
-1. runs `<command>` via shell,
+1. spawns the executable with the structured arguments,
 2. writes the **unsigned** transaction (base64) to its stdin,
 3. reads the **signed** transaction (base64) from its stdout,
 4. validates the returned bytes before anything else: the message bytes
@@ -212,8 +251,8 @@ wallet address (it never signs). At send time the runtime:
    filled — any deviation refuses with `EXTERNAL_SIGNER_MISMATCH`
    (spawn failure, empty or undecodable output:
    `EXTERNAL_SIGNER_FAILED`),
-5. then runs the same mandatory signed-byte simulation and delta
-   enforcement as a local send.
+5. then runs the same mandatory signed-byte simulation and full-effect
+   accounting as a local send.
 
 ## Persistence: what is and isn't proven
 
@@ -227,9 +266,8 @@ about what that means:
   can still lose the file between sessions — and a lost keypair strands
   every lamport sent to it.
 
-So `wallet create` also writes a sidecar, `<file>.agentonly.json`
-(`{createdAt, runtimeVersion}`), and the funding gate is a **second,
-later step**:
+So `wallet create` also writes a sidecar, `<file>.agentonly.json`,
+and the funding gate is a **second, later step**:
 
 ```sh
 agentonly-runtime wallet attest-persistence --file ./my.keypair.json
@@ -239,9 +277,19 @@ Run it as a separate invocation in a later session (ideally after a
 host restart). It stamps `attestedAt` into the sidecar. `prepare` and
 `send` refuse a runtime-created wallet (sidecar present) that has no
 `attestedAt` — `WALLET_NOT_ATTESTED`. Keypair files **without** a
-sidecar are owner-imported and are not gated. Attestation is evidence,
-not a guarantee: back up any wallet that holds meaningful funds
-yourself — this runtime has no recovery.
+sidecar are owner-imported and are not gated.
+
+The sidecar is **integrity-bound to its wallet**: it records the
+wallet address and the SHA-256 of the keypair file's exact bytes, and
+the sidecar file itself gets the same load hardening as the keypair
+(symlinks and group/world-readable sidecars are refused). Attestation
+verifies the recorded address before stamping the binding; every later
+load of a sidecar-gated wallet re-verifies address + hash. A sidecar
+copied from another wallet, or a keypair file whose bytes changed
+since attestation (even a reformat of the same key), refuses with
+`SIDECAR_BINDING_MISMATCH`. Attestation is evidence, not a guarantee:
+back up any wallet that holds meaningful funds yourself — this
+runtime has no recovery.
 
 ## Safety boundaries
 
@@ -277,7 +325,7 @@ yourself — this runtime has no recovery.
 npm test    # node test/fixtures.mjs
 ```
 
-Fifteen acceptance fixtures: persistent local signer (handshake,
+Twenty-two acceptance fixtures: persistent local signer (handshake,
 sidecar, attestation gate, exclusive create) · unsupported signer ·
 unfunded wallet (live) · hook veto on simulation · expired build ·
 approval mismatch · happy-path dry-run with delta enforcement ·
@@ -286,11 +334,22 @@ edited, bytes untouched → refused) · **build/claim mismatch** (build for
 the wrong mint → prepare refuses) · **broadcast-path simulation
 failure** (nothing is broadcast) · **confirmation strategy** (the card's
 blockhash + LVBH reach `confirmTransaction`) · **external signer**
-(good signer completes a dry run; a message-altering signer is refused)
-· **key-file hardening** (0644 and symlinked keypairs refused) ·
-**strict amounts** (exponent/negative/garbage/over-precision rejected).
-All keys in tests are fresh throwaway keypairs in a temp dir; nothing is
-broadcast and no real funds are involved anywhere.
+(good signer completes a dry run; a message-altering signer and a
+shell-string signer are refused) · **key-file hardening** (0644 and
+symlinked keypairs refused) · **strict amounts**
+(exponent/negative/garbage/over-precision rejected) · **malicious
+bundle: extra SOL transfer** (valid swap + 0.5 SOL to a stranger →
+instruction classification refuses at prepare) · **malicious bundle:
+unrelated-token transfer** (→ refused at prepare) · **unexpected
+simulation effect** (a third account gains lamports → `UNEXPECTED_EFFECT`,
+nothing broadcast) · **incomplete simulation state** (→
+`SIMULATION_STATE_MISSING`, fail closed) · **canonical data unavailable
+at send** (→ `CANONICAL_DATA_UNAVAILABLE` before signing) · **real v0
+transaction with an address lookup table** (decoded, validated,
+dry-run) · **sidecar binding** (a copied sidecar and a reformatted
+keypair file both refuse with `SIDECAR_BINDING_MISMATCH`). All keys in
+tests are fresh throwaway keypairs in a temp dir; nothing is broadcast
+and no real funds are involved anywhere.
 
 One scoping note, verified live: the public mainnet RPC refuses to
 simulate *any* transaction whose fee-payer account does not exist
@@ -310,5 +369,5 @@ bin/agentonly-runtime   # entry point
 src/cli.mjs             # commands (thin shell)
 src/runtime.mjs         # gateway client, card logic, signer guard, send path
 src/intent.mjs          # transaction decoding + intent validation (issue #4, P0-1)
-test/fixtures.mjs       # acceptance fixtures (15)
+test/fixtures.mjs       # acceptance fixtures (22)
 ```

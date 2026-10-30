@@ -1,6 +1,6 @@
 {
   "name": "agentonly-runtime",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "description": "AgentOnly reference signer runtime — a small, open, non-custodial local CLI that lets an agent prepare an AgentOnly trade through the Execution Gateway and sign it locally, only after explicit human approval.",
