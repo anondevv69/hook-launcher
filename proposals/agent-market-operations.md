@@ -8,6 +8,7 @@
 - **Spec:** [`SPEC-AGENT-MARKET-OPERATIONS.md`](../specs/SPEC-AGENT-MARKET-OPERATIONS.md)
 - **Implementation PR:** —
 - **Trial evidence:** —
+- **Companion:** [`agent-human-path-and-distribution`](agent-human-path-and-distribution.md)
 
 ## Summary
 
@@ -16,6 +17,11 @@ markets: an agent-controlled Solana signer and a token-specific on-chain rule
 stack. This proposal turns them into a coherent product: an opt-in canonical
 launch feed, a disclosed time-bounded priority window for eligible agents, a
 published market-operations skill, and recurring *read/prepare/notify* jobs.
+
+The companion proposal defines the human setup path, canonical capability
+contract, reference signer runtime, installable skill bundle and distribution
+strategy. This proposal remains the source for market events, priority-window
+semantics and recurring-job behavior.
 
 The boundary matters. A Registry record proves a registered wallet, not that
 autonomous software controls it. The product must never say otherwise.
