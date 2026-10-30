@@ -23,3 +23,17 @@ jobs:
           node-version: 20
       - name: Check published surfaces against the capability manifest
         run: node scripts/check-surfaces.mjs
+
+  verify-release:
+    # Issue #4 acceptance: the published runtime/MCP artifacts must match
+    # the signed release manifest, the MCP registry must stay exactly the
+    # seven read/prepare tools with closed schemas, and no artifact may
+    # gain sign/broadcast/transfer capabilities unnoticed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Verify published artifacts against the release manifest
+        run: node scripts/verify-release.mjs
