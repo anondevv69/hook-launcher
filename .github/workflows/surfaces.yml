@@ -36,4 +36,11 @@ jobs:
         with:
           node-version: 20
       - name: Verify published artifacts against the release manifest
-        run: node scripts/verify-release.mjs
+        # The manifest signature is verified against the pinned release
+        # key BEFORE any artifact is fetched or executed, and the
+        # artifacts are rebuilt from the checkout and hash-compared.
+        # --allow-commit-drift: on PR branches the live manifest still
+        # names the last released commit; the strict sourceCommit check
+        # is enforced at release time, when the manifest is republished
+        # from the merged/tagged commit.
+        run: node scripts/verify-release.mjs --allow-commit-drift
