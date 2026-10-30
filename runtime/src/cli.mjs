@@ -17,7 +17,8 @@
 //           --side buy|sell --amount <ui> [--out ./approval-card.json]
 //   send --file <keypair> --card <card.json> --approve <fingerprint>
 //        [--dry-run] [--signer-type ...]
-//   send --signer-type external --external-signer "<command>"
+//   send --signer-type external --external-signer <executable-path>
+//        [--external-signer-arg <value> ...]
 //        --wallet <address> --card <card.json> --approve <fingerprint>
 //        [--dry-run]
 //
@@ -38,6 +39,7 @@ import {
   formatCard,
   formatInspect,
   inspectToken,
+  keypairFileSha256,
   loadKeypair,
   prepareTrade,
   readWalletSidecar,
@@ -57,7 +59,10 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const key = a.slice(2);
       if (key === 'dry-run') flags[key] = true;
-      else flags[key] = argv[++i];
+      else if (key === 'external-signer-arg') {
+        // Repeatable: structured argv for the external signer.
+        (flags[key] ??= []).push(argv[++i]);
+      } else flags[key] = argv[++i];
     } else positional.push(a);
   }
   return { positional, flags };
@@ -120,6 +125,7 @@ async function walletCreate(flags) {
     createdAt: new Date().toISOString(),
     runtimeVersion: RUNTIME_VERSION,
     address: expected,
+    keypairSha256: keypairFileSha256(file),
     attestedAt: null,
   });
   console.log(`wallet created: ${file} (permissions 0600, created exclusively — existing files are never overwritten)`);
@@ -141,15 +147,30 @@ async function walletAttest(flags) {
   const file = flags.file;
   if (!file) throw new RuntimeError('INVALID_ARGS', 'wallet attest-persistence requires --file <path>');
   const kp = loadKeypair(file); // hardened load: symlink / permission checks apply
-  const sc = readWalletSidecar(file);
+  const sc = readWalletSidecar(file); // hardened load: symlink / permission checks apply
   if (!sc) {
     console.log(`${kp.publicKey.toBase58()} — no runtime sidecar for this file: it is owner-imported and is not gated by attestation. Nothing to stamp.`);
     return;
   }
+  // Binding (repair round 2, P1-g): the sidecar must name THIS wallet
+  // before it may be stamped. A sidecar copied from another wallet is
+  // refused here, and attestation (re)binds the sidecar to the keypair
+  // file's exact bytes — later loads re-verify both.
+  const address = kp.publicKey.toBase58();
+  if (sc.address && sc.address !== address) {
+    throw new RuntimeError(
+      'SIDECAR_BINDING_MISMATCH',
+      `refusing to attest: the sidecar ${walletSidecarPath(file)} records address ${sc.address} but this keypair file derives ${address}. The sidecar belongs to a different wallet.`,
+      { file },
+    );
+  }
+  sc.address = address;
+  sc.keypairSha256 = keypairFileSha256(file);
   sc.attestedAt = new Date().toISOString();
   sc.attestedRuntimeVersion = RUNTIME_VERSION;
   writeWalletSidecar(file, sc);
-  console.log(`persistence attested: ${kp.publicKey.toBase58()} at ${sc.attestedAt}`);
+  console.log(`persistence attested: ${address} at ${sc.attestedAt}`);
+  console.log(`sidecar bound to this keypair file (address + sha256 of its bytes); later loads re-verify the binding.`);
   console.log('This records that the keypair file was still readable in a session later than its creation. It is evidence, not a guarantee — keep your own backup of any wallet holding meaningful funds.');
 }
 
@@ -205,7 +226,7 @@ async function main() {
 
   if (cmd === 'send') {
     if (!flags.card || !flags.approve) {
-      throw new RuntimeError('INVALID_ARGS', 'send requires --card and --approve <fingerprint> (plus --file, or --signer-type external --external-signer <command> --wallet <address>)');
+      throw new RuntimeError('INVALID_ARGS', 'send requires --card and --approve <fingerprint> (plus --file, or --signer-type external --external-signer <executable-path> --wallet <address>)');
     }
     let card;
     try {
@@ -219,20 +240,20 @@ async function main() {
     let external = null;
     if (signerType === 'external') {
       if (!flags['external-signer'] || !flags.wallet) {
-        throw new RuntimeError('INVALID_ARGS', 'external send requires --external-signer "<command>" and --wallet <address>');
+        throw new RuntimeError('INVALID_ARGS', 'external send requires --external-signer <executable-path> [--external-signer-arg <value> ...] and --wallet <address>');
       }
-      external = { address: flags.wallet, command: flags['external-signer'] };
+      external = { address: flags.wallet, command: flags['external-signer'], args: flags['external-signer-arg'] ?? [] };
     } else {
       if (!flags.file) throw new RuntimeError('INVALID_ARGS', 'send requires --file <keypair>');
       assertWalletAttested(flags.file);
       keypair = loadKeypair(flags.file);
     }
     const connection = new Connection(process.env.AGENTONLY_RPC_URL ?? RPC_URL, 'confirmed');
-    // Canonical token record, best-effort: it lets send re-check the
-    // build against the token's pool. If the site is unreachable, the
-    // intent deep-compare still binds the send to the prepared card.
-    let tokenJson;
-    try { tokenJson = await fetchTokenRecord(fetch, card.mint); } catch { tokenJson = undefined; }
+    // Canonical token record — REQUIRED at send (repair round 2, P1-d):
+    // it carries the pool the intent re-validation and full-effect
+    // accounting check against. A fetch failure refuses the send with
+    // CANONICAL_DATA_UNAVAILABLE; pool validation is never skipped.
+    const tokenJson = await fetchTokenRecord(fetch, card.mint);
     const result = await sendCard({
       keypair,
       external,
@@ -250,16 +271,10 @@ async function main() {
       if (result.deltas) {
         console.log(`simulated deltas: SOL ${result.deltas.solDelta} lamports · token ${result.deltas.tokenDelta} raw units`);
       }
-      if (result.economicBounds && result.economicBounds !== 'enforced') {
-        console.log(`WARNING: economic bounds ${result.economicBounds}`);
-      }
-      console.log('Simulation passed and deltas are within the card bounds. Re-run without --dry-run (same card, same approval) to broadcast.');
+      console.log('Simulation passed; full-effect accounting and the card bounds are enforced. Re-run without --dry-run (same card, same approval) to broadcast.');
     } else {
       console.log('BROADCAST + CONFIRMED');
       console.log(JSON.stringify(result.receipt, null, 2));
-      if (result.economicBounds && result.economicBounds !== 'enforced') {
-        console.log(`WARNING: economic bounds ${result.economicBounds}`);
-      }
     }
     return;
   }
@@ -272,7 +287,7 @@ async function main() {
   console.error('  agentonly-runtime prepare --file <keypair> --mint <mint> --side buy|sell --amount <ui> [--signer-type own|sandbox] [--max-fee-lamports <n>] [--out ./approval-card.json]');
   console.error('  agentonly-runtime prepare --signer-type external --wallet <address> --mint <mint> --side buy|sell --amount <ui> [--out ./approval-card.json]');
   console.error('  agentonly-runtime send --file <keypair> --card <card.json> --approve <fingerprint> [--dry-run]');
-  console.error('  agentonly-runtime send --signer-type external --external-signer "<command>" --wallet <address> --card <card.json> --approve <fingerprint> [--dry-run]');
+  console.error('  agentonly-runtime send --signer-type external --external-signer <executable-path> [--external-signer-arg <value> ...] --wallet <address> --card <card.json> --approve <fingerprint> [--dry-run]');
   process.exit(2);
 }
 

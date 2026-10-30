@@ -32,6 +32,10 @@ export const SYSTEM_PROGRAM = '11111111111111111111111111111111';
 export const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111';
 export const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 export const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+// Wrapped SOL — the mint real venue builds wrap the trade's SOL into
+// (and unwrap out of) around the swap. The wallet's own WSOL ATA is
+// part of the approved trade shape (repair round 2.1).
+export const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 export const ATA_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 export const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
 export const MEMO_PROGRAM_V1 = 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo';
@@ -116,6 +120,7 @@ function kindSummary(programId, tag) {
         5: `${name}: revoke delegation`, 6: `${name}: SET AUTHORITY`, 7: `${name}: mint to`,
         8: `${name}: burn`, 9: `${name}: close account`, 12: `${name}: transfer (checked)`,
         13: `${name}: APPROVE CHECKED (delegation)`, 16: `${name}: amount to UI amount`,
+        17: `${name}: sync native (wrapped SOL)`,
         22: `${name}: transfer fee extension`,
       }[tag] ?? `${name} instruction (tag ${tag})`;
     }
@@ -163,6 +168,93 @@ export function legacyMessageBytes(bytes) {
   return Buffer.from(bytes.subarray(afterCount + count * 64));
 }
 
+// Where the message starts in a serialized transaction, and whether the
+// transaction is versioned. A serialized transaction begins with a
+// signature-count SHORTVEC followed by count×64 signature bytes; the
+// version flag is the top bit of the first MESSAGE byte after that
+// block — NOT byte 0 of the blob (byte 0 is the shortvec, whose top bit
+// only means "the count continues", e.g. ≥128 signatures). Sniffing
+// byte 0 misdetects real v0 transactions (repair round 2, P1-f).
+export function serializedTxKind(bytes) {
+  const [count, afterCount] = readShortvecLength(bytes, 0);
+  const messageStart = afterCount + count * 64;
+  if (messageStart >= bytes.length) {
+    throw new IntentError('INTENT_DECODE_FAILED', 'serialized transaction is truncated: no message after the signature block');
+  }
+  return { versioned: (bytes[messageStart] & 0x80) !== 0, messageStart, signatureCount: count };
+}
+
+// ---------------------------------------------------------------------------
+// Trade account sets (canonical pool + derived token accounts)
+// ---------------------------------------------------------------------------
+
+export function associatedTokenAddress(mint, owner, tokenProgram) {
+  return PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), new PublicKey(tokenProgram).toBuffer(), mint.toBuffer()],
+    new PublicKey(ATA_PROGRAM),
+  )[0];
+}
+
+// Every pool address the canonical record names: the top-level `pool`,
+// `addresses.pool`, and house/curve variants where a record carries
+// them. A record may name several (e.g. before/after graduation).
+export function canonicalPools(tokenJson) {
+  const pools = new Set();
+  const add = (v) => { if (typeof v === 'string' && v) pools.add(v); };
+  add(tokenJson?.pool);
+  const a = tokenJson?.addresses ?? {};
+  add(a.pool);
+  add(a.housePool);
+  add(a.curvePool);
+  return [...pools];
+}
+
+// Extra pool-side vault accounts a canonical record may name explicitly
+// (SOL vault / token vault of the pool). Derived pool ATAs are computed
+// separately in tradeAccountSets.
+export function canonicalPoolVaults(tokenJson) {
+  const a = tokenJson?.addresses ?? {};
+  const vaults = new Set();
+  for (const k of ['quoteVault', 'solVault', 'tokenVault', 'baseVault', 'vault']) {
+    if (typeof a[k] === 'string' && a[k]) vaults.add(a[k]);
+  }
+  return [...vaults];
+}
+
+// The account sets the trade is allowed to touch, derived from the card
+// context + canonical record:
+//  - walletAtas: the wallet's token accounts for the card mint (both
+//    token programs);
+//  - wsolAta: the wallet's own associated token account for wrapped
+//    SOL (legacy token program). Real venue builds wrap the trade SOL
+//    into it and unwrap out of it around the swap; its lamports ARE
+//    the wallet's SOL, so full-effect accounting folds its lamport
+//    delta into the wallet's aggregate SOL delta (repair round 2.1);
+//  - pools / poolAccounts: canonical pool addresses, their derived
+//    token vaults (ATAs of the pool for the card mint, both programs),
+//    and any vaults the record names explicitly;
+//  - permitted: wallet + walletAtas + wsolAta + poolAccounts — the
+//    ONLY accounts whose lamport/token balances may change in the
+//    trade (full-effect accounting at send time enforces this).
+export function tradeAccountSets({ wallet, mint, tokenJson }) {
+  const owner = new PublicKey(wallet);
+  const mintPk = new PublicKey(mint);
+  const walletAtas = [TOKEN_PROGRAM, TOKEN_2022_PROGRAM]
+    .map((tp) => associatedTokenAddress(mintPk, owner, tp).toBase58());
+  const wsolAta = associatedTokenAddress(new PublicKey(WSOL_MINT), owner, TOKEN_PROGRAM).toBase58();
+  const pools = canonicalPools(tokenJson);
+  const poolAccounts = new Set(pools);
+  for (const p of pools) {
+    const poolPk = new PublicKey(p);
+    for (const tp of [TOKEN_PROGRAM, TOKEN_2022_PROGRAM]) {
+      poolAccounts.add(associatedTokenAddress(mintPk, poolPk, tp).toBase58());
+    }
+  }
+  for (const v of canonicalPoolVaults(tokenJson)) poolAccounts.add(v);
+  const permitted = new Set([wallet, ...walletAtas, wsolAta, ...poolAccounts]);
+  return { walletAtas, wsolAta, pools, poolAccounts: [...poolAccounts], permitted };
+}
+
 function isWritableIndex(header, accountCount, i) {
   if (i < header.numRequiredSignatures) {
     return i < header.numRequiredSignatures - header.numReadonlySignedAccounts;
@@ -179,7 +271,37 @@ function normalizeInstructions(compiled, keys, dataOf) {
     const writableAccounts = (ix.accounts ?? ix.accountKeyIndexes ?? [])
       .filter((ai) => ix._writable?.has(ai))
       .map((ai) => keys[ai]?.toBase58() ?? 'unknown');
-    return { programId, kind: kindSummary(programId, tag), tag, accounts, writableAccounts };
+    const out = { programId, kind: kindSummary(programId, tag), tag, accounts, writableAccounts };
+    // Parsed transfer payloads — JSON-safe strings only, so the intent
+    // survives the approval-card file round-trip and the send-time
+    // deep-compare still binds these exact values.
+    if (programId === SYSTEM_PROGRAM && tag === 2 && data && data.length >= 12 && accounts.length >= 2) {
+      // System Transfer: u32 LE tag, u64 LE lamports; accounts [from, to]
+      out.transfer = {
+        from: accounts[0],
+        to: accounts[1],
+        lamports: Buffer.from(data).readBigUInt64LE(4).toString(),
+      };
+    }
+    if ((programId === TOKEN_PROGRAM || programId === TOKEN_2022_PROGRAM) && data && data.length >= 9) {
+      if (tag === 3 && accounts.length >= 2) {
+        // Transfer: u64 LE amount at offset 1; accounts [source, dest, owner]
+        out.tokenTransfer = {
+          source: accounts[0],
+          destination: accounts[1],
+          amount: Buffer.from(data).readBigUInt64LE(1).toString(),
+        };
+      } else if (tag === 12 && accounts.length >= 3) {
+        // TransferChecked: u64 LE amount at offset 1; accounts [source, mint, dest, owner]
+        out.tokenTransfer = {
+          source: accounts[0],
+          mint: accounts[1],
+          destination: accounts[2],
+          amount: Buffer.from(data).readBigUInt64LE(1).toString(),
+        };
+      }
+    }
+    return out;
   });
 }
 
@@ -270,7 +392,7 @@ function totalLookupCount(msg) {
 export async function deriveIntent(input, connection) {
   const bytes = Buffer.isBuffer(input) ? input : Buffer.from(input, 'base64');
   try {
-    if ((bytes[0] & 0x80) !== 0) return await decodeVersioned(bytes, connection);
+    if (serializedTxKind(bytes).versioned) return await decodeVersioned(bytes, connection);
     return decodeLegacy(bytes);
   } catch (e) {
     if (e instanceof IntentError) throw e;
@@ -281,6 +403,113 @@ export async function deriveIntent(input, connection) {
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Instruction classification (repair round 2, P0-1b)
+//
+// Program allowlisting alone is NOT semantic validation: a build could
+// pass the allowlist while bundling an extra System transfer to a
+// stranger next to a legitimate swap. So every decoded instruction
+// must additionally CLASSIFY into the exact approved trade shape.
+// Anything that cannot be classified refuses with
+// UNCLASSIFIED_INSTRUCTION. (The blanket bans — non-allowlisted
+// programs, SetComputeUnitPrice, Approve/SetAuthority — keep their own
+// codes and fire before classification.)
+// ---------------------------------------------------------------------------
+
+function unclassified(ix, why) {
+  return new IntentError(
+    'UNCLASSIFIED_INSTRUCTION',
+    `decoded instruction cannot be classified into the approved trade shape: ${ix.kind} [${ix.programId}] — ${why}. Refusing.`,
+    { programId: ix.programId, kind: ix.kind },
+  );
+}
+
+// ctx: { wallet, mint, side, venueProgram, sets (tradeAccountSets) }
+function classifyInstruction(ix, ctx) {
+  const { wallet, mint, side, venueProgram, sets } = ctx;
+  const pid = ix.programId;
+
+  if (pid === COMPUTE_BUDGET_PROGRAM) {
+    // SetComputeUnitPrice (tag 3) is already rejected above; only the
+    // limit / heap-frame settings are part of a trade.
+    if (ix.tag === 1 || ix.tag === 2) return 'compute';
+    throw unclassified(ix, 'only SetComputeUnitLimit / RequestHeapFrame belong to a trade');
+  }
+  if (pid === MEMO_PROGRAM || pid === MEMO_PROGRAM_V1) return 'memo';
+  if (pid === PLATFORM_PROGRAMS.engine || pid === PLATFORM_PROGRAMS.registry || pid === PLATFORM_PROGRAMS.distributor) {
+    return 'platform';
+  }
+  if (pid === PLATFORM_PROGRAMS.dbc || pid === PLATFORM_PROGRAMS.house) {
+    if (!venueProgram || pid === venueProgram) return 'venue-swap';
+    throw unclassified(ix, 'instruction runs on a venue program that is not the quoted venue');
+  }
+  if (pid === ATA_PROGRAM) {
+    // CreateAssociatedTokenAccount (incl. CreateIdempotent) accounts:
+    // [funder, ata, owner, mint, system program, token program]
+    // Belongs to the trade in exactly two shapes: the wallet's own
+    // account for the card mint, or the wallet's own wrapped-SOL
+    // account (real venue builds create it before wrapping). The
+    // created address must be the true derived ATA for the
+    // instruction's token program — a lookalike address refuses.
+    const [funder, ata, owner, mintAcct, , tokenProgram] = ix.accounts;
+    let expectedAta = null;
+    try {
+      if (owner && mintAcct && tokenProgram) {
+        expectedAta = associatedTokenAddress(new PublicKey(mintAcct), new PublicKey(owner), tokenProgram).toBase58();
+      }
+    } catch { expectedAta = null; }
+    if (funder === wallet && owner === wallet && ata === expectedAta && mintAcct === mint) return 'ata-create';
+    if (funder === wallet && owner === wallet && ata === expectedAta && mintAcct === WSOL_MINT) return 'wsol-ata-create';
+    throw unclassified(ix, 'an ATA creation belongs to the trade only when it creates the wallet\u2019s own account for the card mint or for wrapped SOL, at its true derived address');
+  }
+  if (pid === SYSTEM_PROGRAM) {
+    if (ix.tag === 2 && ix.transfer) {
+      const { from, to } = ix.transfer;
+      if (side === 'buy' && from === wallet && sets.pools.includes(to)) return 'trade-transfer';
+      if (side === 'sell' && sets.pools.includes(from) && to === wallet) return 'trade-transfer';
+      // The wrap leg: the wallet funds its OWN derived wrapped-SOL
+      // account (either side — a sell build may wrap around the swap
+      // too). No other System destination is admitted.
+      if (from === wallet && to === sets.wsolAta) return 'wsol-wrap';
+      throw unclassified(ix, `a System transfer ${from} \u2192 ${to} is not the trade\u2019s wallet\u2194pool leg or the wallet\u2019s own wrapped-SOL wrap`);
+    }
+    throw unclassified(ix, 'only a wallet\u2194pool SOL transfer or the wallet\u2019s own wrapped-SOL wrap belongs to a trade');
+  }
+  if (pid === TOKEN_PROGRAM || pid === TOKEN_2022_PROGRAM) {
+    // SyncNative (tag 17): syncs a native (wrapped-SOL) account's
+    // token balance to its lamports. Belongs to the trade ONLY as the
+    // wrap step on the wallet's own WSOL ATA — sole account, nothing
+    // else.
+    if (ix.tag === 17) {
+      if (ix.accounts.length === 1 && ix.accounts[0] === sets.wsolAta) return 'wsol-sync';
+      throw unclassified(ix, 'a SyncNative belongs to the trade only on the wallet\u2019s own wrapped-SOL account, as its sole account');
+    }
+    // CloseAccount (tag 9): accounts [account, destination, owner].
+    // Belongs to the trade ONLY as the unwrap: closing the wallet's
+    // own WSOL ATA with the lamports returning to the wallet itself.
+    // Closing the card-mint ATA (or anything else) stays refused.
+    if (ix.tag === 9) {
+      const [acct, dest, owner] = ix.accounts;
+      if (acct === sets.wsolAta && dest === wallet && owner === wallet) return 'wsol-close';
+      throw unclassified(ix, 'closing an account belongs to the trade only when it unwraps the wallet\u2019s own wrapped-SOL account back to the wallet');
+    }
+    if ((ix.tag === 3 || ix.tag === 12) && ix.tokenTransfer) {
+      const t = ix.tokenTransfer;
+      if (t.mint && t.mint !== mint) {
+        throw unclassified(ix, `token instruction touches mint ${t.mint}, not the card mint ${mint}`);
+      }
+      const srcWallet = sets.walletAtas.includes(t.source);
+      const dstWallet = sets.walletAtas.includes(t.destination);
+      const srcPool = sets.poolAccounts.includes(t.source);
+      const dstPool = sets.poolAccounts.includes(t.destination);
+      if ((srcWallet && dstPool) || (srcPool && dstWallet)) return 'trade-transfer';
+      throw unclassified(ix, `a token transfer ${t.source} \u2192 ${t.destination} is not between the wallet\u2019s account for the card mint and the pool vault`);
+    }
+    throw unclassified(ix, 'only Transfer/TransferChecked between the wallet and the pool vault belong to a trade');
+  }
+  throw unclassified(ix, 'no classification rule covers this program in a trade');
+}
 
 // Validates a derived intent against the trade context. ctx:
 // { wallet, mint, side, venue ('curve'|'house'|null), tokenJson (canonical
@@ -345,8 +574,17 @@ export function validateIntent(intent, ctx) {
   }
 
   let venueProgram = null;
+  if (venue) venueProgram = VENUE_PROGRAM_BY_VENUE[venue] ?? null;
+
+  // P0-1b: EVERY instruction must classify into the approved trade
+  // shape. This is what stops a bundled extra transfer riding along
+  // with a legitimate swap.
+  const sets = tradeAccountSets({ wallet, mint, tokenJson: ctx.tokenJson });
+  for (const ix of intent.instructions) {
+    classifyInstruction(ix, { wallet, mint, side: ctx.side, venueProgram, sets });
+  }
+
   if (venue) {
-    venueProgram = VENUE_PROGRAM_BY_VENUE[venue] ?? null;
     if (venueProgram && !intent.instructions.some((ix) => ix.programId === venueProgram)) {
       throw new IntentError(
         'INTENT_VENUE_MISMATCH',
@@ -354,11 +592,11 @@ export function validateIntent(intent, ctx) {
         { venue, venueProgram },
       );
     }
-    if (venue === 'curve' && ctx.tokenJson?.pool && !intent.allAccounts.includes(ctx.tokenJson.pool)) {
+    if (venue === 'curve' && sets.pools.length && !sets.pools.some((p) => intent.allAccounts.includes(p))) {
       throw new IntentError(
         'INTENT_POOL_MISMATCH',
-        `decoded transaction does not touch the canonical curve pool ${ctx.tokenJson.pool} from the token record. Refusing.`,
-        { pool: ctx.tokenJson.pool },
+        `decoded transaction does not touch the canonical curve pool (${sets.pools.join(', ')}) from the token record. Refusing.`,
+        { pool: sets.pools[0] },
       );
     }
   }

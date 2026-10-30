@@ -22,7 +22,9 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  accessSync,
   chmodSync,
+  constants,
   existsSync,
   lstatSync,
   readFileSync,
@@ -41,17 +43,25 @@ import {
   ATA_PROGRAM,
   TOKEN_2022_PROGRAM,
   TOKEN_PROGRAM,
+  WSOL_MINT,
+  associatedTokenAddress,
   deriveIntent,
   intentSummaryLines,
   intentsEqual,
   legacyMessageBytes,
   parseStrictDecimal,
+  serializedTxKind,
+  tradeAccountSets,
   validateIntent,
 } from './intent.mjs';
 
 export {
+  WSOL_MINT,
+  associatedTokenAddress,
   deriveIntent,
   parseStrictDecimal,
+  serializedTxKind,
+  tradeAccountSets,
   validateIntent,
 } from './intent.mjs';
 
@@ -192,18 +202,76 @@ export function walletSidecarPath(file) {
   return `${file}.agentonly.json`;
 }
 
+export function keypairFileSha256(file) {
+  return createHash('sha256').update(readFileSync(file)).digest('hex');
+}
+
+// The sidecar gets the same load hardening as the keypair file itself
+// (repair round 2, P1-g): a symlinked or group/world-readable sidecar
+// is refused, because the sidecar is what the attestation gate trusts.
 export function readWalletSidecar(file) {
   const p = walletSidecarPath(file);
-  if (!existsSync(p)) return null;
+  let stat;
+  try {
+    stat = lstatSync(p);
+  } catch {
+    return null; // no sidecar: owner-imported wallet, not gated
+  }
+  if (stat.isSymbolicLink()) {
+    throw new RuntimeError(
+      'SIDECAR_SYMLINK',
+      `refusing to trust a wallet sidecar reached through a symlink: ${p} — pass the real file path instead`,
+    );
+  }
+  if (!stat.isFile()) {
+    throw new RuntimeError('SIDECAR_INVALID', `wallet sidecar path is not a regular file: ${p}`);
+  }
+  if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
+    throw new RuntimeError(
+      'SIDECAR_PERMISSIONS',
+      `refusing to trust wallet sidecar ${p}: it is accessible by group/others ` +
+        `(mode ${(stat.mode & 0o777).toString(8)}). The attestation record must be owner-only — fix it with: chmod 600 ${p}`,
+    );
+  }
   try {
     return JSON.parse(readFileSync(p, 'utf8'));
   } catch {
-    return null;
+    throw new RuntimeError('SIDECAR_INVALID', `wallet sidecar is not readable JSON: ${p} — refusing to guess at the attestation state`);
   }
 }
 
 export function writeWalletSidecar(file, sidecar) {
   writeFileSync(walletSidecarPath(file), JSON.stringify(sidecar, null, 2) + '\n', { mode: 0o600 });
+}
+
+// The sidecar is integrity-bound to the wallet it describes (P1-g): it
+// records the wallet address AND the SHA-256 of the keypair file's
+// exact bytes. Attestation stamps the binding; every later load of a
+// sidecar-gated wallet re-verifies it. A sidecar copied onto another
+// wallet, or a keypair file whose bytes changed since attestation
+// (even a reformat of the same key), refuses with
+// SIDECAR_BINDING_MISMATCH. A sidecar with no binding yet (written by
+// an older runtime) is unbound: attest-persistence establishes the
+// binding after checking the recorded address.
+export function verifySidecarBinding(file, sidecar) {
+  const sc = sidecar ?? readWalletSidecar(file);
+  if (!sc) return;
+  const address = loadKeypair(file).publicKey.toBase58();
+  if (!sc.keypairSha256) {
+    throw new RuntimeError(
+      'SIDECAR_BINDING_MISMATCH',
+      `wallet sidecar ${walletSidecarPath(file)} carries no keypair binding (it predates the binding, or was stripped) — refusing to trust it. Run: agentonly-runtime wallet attest-persistence --file ${file} (it verifies the recorded address, then binds the sidecar to this keypair file)`,
+      { file },
+    );
+  }
+  const digest = keypairFileSha256(file);
+  if (sc.address !== address || sc.keypairSha256 !== digest) {
+    throw new RuntimeError(
+      'SIDECAR_BINDING_MISMATCH',
+      `wallet sidecar ${walletSidecarPath(file)} does not belong to this keypair file: it records address ${sc.address ?? '(none)'} / keypair sha256 ${String(sc.keypairSha256).slice(0, 12)}… but the file derives ${address} / ${digest.slice(0, 12)}…. The sidecar was copied from another wallet or the keypair file changed since attestation. Refusing — restore the original sidecar, or delete it and treat the wallet as owner-imported with your eyes open.`,
+      { file },
+    );
+  }
 }
 
 // The two-session rule: a wallet THIS runtime created (sidecar present)
@@ -214,7 +282,8 @@ export function writeWalletSidecar(file, sidecar) {
 // Keypair files with no sidecar are owner-imported and are not gated.
 export function assertWalletAttested(file) {
   const sc = readWalletSidecar(file);
-  if (sc && !sc.attestedAt) {
+  if (!sc) return; // owner-imported: not gated
+  if (!sc.attestedAt) {
     throw new RuntimeError(
       'WALLET_NOT_ATTESTED',
       `refusing: wallet ${file} was created by this runtime (sidecar ${walletSidecarPath(file)}) ` +
@@ -225,6 +294,8 @@ export function assertWalletAttested(file) {
       { file },
     );
   }
+  // Attested: the sidecar must still belong to THIS keypair file.
+  verifySidecarBinding(file, sc);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,8 +385,21 @@ export function formatInspect({ token, market }) {
 // Canonical token record (prepare + intent validation)
 // ---------------------------------------------------------------------------
 
+// Canonical token data is load-bearing: it carries the decimals the
+// amount parse uses and the pool the intent validation checks. A fetch
+// failure or non-200 therefore REFUSES the operation (repair round 2,
+// P1-d) — pool validation is never skipped silently.
 export async function fetchTokenRecord(fetchImpl, mint) {
-  const info = await siteGetJson(fetchImpl, `/api/v1/tokens/${mint}.json`);
+  let info;
+  try {
+    info = await siteGetJson(fetchImpl, `/api/v1/tokens/${mint}.json`);
+  } catch (e) {
+    throw new RuntimeError(
+      'CANONICAL_DATA_UNAVAILABLE',
+      `canonical token record for ${mint} could not be fetched (${e.message}) — refusing: intent and pool validation depend on it and are never skipped`,
+      { mint, cause: e },
+    );
+  }
   return info.token ?? info;
 }
 
@@ -545,7 +629,7 @@ export async function freshQuoteVenue(fetchImpl, card) {
 }
 
 function deserializeAny(bytes) {
-  return (bytes[0] & 0x80) !== 0
+  return serializedTxKind(bytes).versioned
     ? VersionedTransaction.deserialize(bytes)
     : Transaction.from(bytes);
 }
@@ -560,63 +644,94 @@ function signatureOf(tx) {
 }
 
 async function messageBytesOf(bytes) {
-  if ((bytes[0] & 0x80) !== 0) {
+  if (serializedTxKind(bytes).versioned) {
     return Buffer.from(VersionedTransaction.deserialize(bytes).message.serialize());
   }
   return legacyMessageBytes(bytes);
 }
 
 function firstSignatureBytes(bytes) {
-  if ((bytes[0] & 0x80) !== 0) {
-    return VersionedTransaction.deserialize(bytes).signatures[0] ?? null;
-  }
-  // legacy: shortvec signature count, then 64-byte signatures
-  let len = 0;
-  let shift = 0;
-  let i = 0;
-  for (;;) {
-    const b = bytes[i++];
-    len |= (b & 0x7f) << shift;
-    if ((b & 0x80) === 0) break;
-    shift += 7;
-  }
-  if (len < 1) return null;
-  return bytes.subarray(i, i + 64);
+  // Both formats lead with a shortvec signature count followed by
+  // 64-byte signatures; the first signature is the fee payer's.
+  const { messageStart, signatureCount } = serializedTxKind(bytes);
+  if (signatureCount < 1) return null;
+  const sigStart = messageStart - signatureCount * 64;
+  return bytes.subarray(sigStart, sigStart + 64);
 }
 
 // ---------------------------------------------------------------------------
-// External signer adapter (P1-a)
+// External signer adapter (P1-a; shell removed in repair round 2, P1-e)
 //
-// Protocol: the runtime runs the owner's command via shell, writes the
-// UNSIGNED transaction (base64) to its stdin, and reads the SIGNED
-// transaction (base64) from its stdout. The returned bytes are validated
-// before anything else happens: message bytes byte-identical to the
-// unsigned transaction, fee payer unchanged, the wallet's signature slot
+// Protocol: the runtime spawns a TRUSTED EXECUTABLE directly (spawn
+// with shell: false — never a shell, so signer text can never become
+// shell syntax), passes structured arguments from repeatable
+// --external-signer-arg flags, writes the UNSIGNED transaction
+// (base64) to its stdin, and reads the SIGNED transaction (base64)
+// from its stdout. The returned bytes are validated before anything
+// else happens: message bytes byte-identical to the unsigned
+// transaction, fee payer unchanged, the wallet's signature slot
 // filled. The mandatory signed-byte simulation then applies as usual.
 // ---------------------------------------------------------------------------
 
-function defaultRunCommand(command, inputBase64) {
+// --external-signer must name one plain executable path: no spaces, no
+// shell metacharacters, and the file must exist and be executable.
+// Anything else is refused before any spawn can happen.
+export function assertValidExternalSigner(executable) {
+  const bad = typeof executable !== 'string'
+    || executable.length === 0
+    || executable !== executable.trim()
+    || /[^A-Za-z0-9/._+\-]/.test(executable);
+  if (bad) {
+    throw new RuntimeError(
+      'EXTERNAL_SIGNER_INVALID',
+      `--external-signer must be a single plain executable path with no spaces or shell metacharacters (got '${executable}'). Arguments go in repeatable --external-signer-arg flags — they are passed as structured argv, never through a shell.`,
+      { executable },
+    );
+  }
+  let stat;
+  try {
+    stat = lstatSync(executable);
+  } catch {
+    throw new RuntimeError('EXTERNAL_SIGNER_INVALID', `external signer executable does not exist: ${executable}`);
+  }
+  if (!stat.isFile()) {
+    throw new RuntimeError('EXTERNAL_SIGNER_INVALID', `external signer path is not a regular file: ${executable}`);
+  }
+  try {
+    accessSync(executable, constants.X_OK);
+  } catch {
+    throw new RuntimeError('EXTERNAL_SIGNER_INVALID', `external signer file is not executable: ${executable} (chmod +x it, or name an interpreter such as your node binary and pass the script via --external-signer-arg)`);
+  }
+}
+
+function defaultRunSigner(executable, args, inputBase64) {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, { shell: true, stdio: ['pipe', 'pipe', 'inherit'] });
+    const child = spawn(executable, args, { shell: false, stdio: ['pipe', 'pipe', 'inherit'] });
     let out = '';
     child.stdout.on('data', (d) => { out += d; });
     child.on('error', rejectPromise);
     child.on('close', (code) => {
       if (code === 0) resolvePromise(out);
-      else rejectPromise(new Error(`external signer command exited with code ${code}`));
+      else rejectPromise(new Error(`external signer exited with code ${code}`));
     });
     child.stdin.write(inputBase64);
     child.stdin.end();
   });
 }
 
-export async function runExternalSigner(command, unsignedBase64, opts = {}) {
-  const run = opts.runCommand ?? defaultRunCommand;
+// opts: { args?: string[], runCommand?: (executable, args, inputB64) => Promise<string> }
+export async function runExternalSigner(executable, unsignedBase64, opts = {}) {
+  const args = opts.args ?? [];
+  assertValidExternalSigner(executable);
+  if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) {
+    throw new RuntimeError('EXTERNAL_SIGNER_INVALID', 'external signer arguments must be strings (repeatable --external-signer-arg)');
+  }
+  const run = opts.runCommand ?? defaultRunSigner;
   let stdout;
   try {
-    stdout = await run(command, unsignedBase64);
+    stdout = await run(executable, args, unsignedBase64);
   } catch (e) {
-    throw new RuntimeError('EXTERNAL_SIGNER_FAILED', `external signer command failed: ${e.message}`);
+    throw new RuntimeError('EXTERNAL_SIGNER_FAILED', `external signer failed: ${e.message}`);
   }
   const signedB64 = String(stdout ?? '').trim();
   if (!signedB64) {
@@ -668,16 +783,11 @@ export async function validateExternalSigned(unsignedBytes, signedBytes, wallet)
 // Signed-byte simulation + economic bounds (P0-1d, P0-2a)
 // ---------------------------------------------------------------------------
 
-export function associatedTokenAddress(mint, owner, tokenProgram) {
-  return PublicKey.findProgramAddressSync(
-    [owner.toBuffer(), new PublicKey(tokenProgram).toBuffer(), mint.toBuffer()],
-    new PublicKey(ATA_PROGRAM),
-  )[0];
-}
-
 // Accounts whose pre/post states the economic check reads: the wallet
 // itself (SOL delta) and its associated token accounts for the mint
-// under both token programs (token delta).
+// under both token programs (token delta). Full-effect accounting
+// (sendCard) widens this to every writable account in the intent plus
+// the canonical pool set; this helper stays the minimal core.
 export function economicAccountAddresses(wallet, mintStr) {
   const owner = new PublicKey(wallet);
   const mint = new PublicKey(mintStr);
@@ -698,7 +808,10 @@ function normalizeAccountState(acct) {
   else if (Array.isArray(data) && typeof data[0] === 'string') buf = Buffer.from(data[0], data[1] === 'base64' ? 'base64' : 'utf8');
   else if (typeof data === 'string') buf = Buffer.from(data, 'base64');
   else buf = Buffer.alloc(0);
-  return { lamports: acct.lamports ?? 0, data: buf };
+  const owner = !acct.owner
+    ? null
+    : (typeof acct.owner === 'string' ? acct.owner : (acct.owner.toBase58?.() ?? null));
+  return { lamports: acct.lamports ?? 0, data: buf, owner };
 }
 
 async function fetchAccountStates(connection, fetchImpl, rpcUrl, addresses) {
@@ -793,6 +906,142 @@ export function computeDeltas(preStates, postStates, addresses, wallet, mint) {
   return { solDelta, tokenDelta };
 }
 
+// ---------------------------------------------------------------------------
+// Full-effect accounting (repair round 2, P0-1a) + fail-closed simulation
+// state (P0-2)
+//
+// Round 1 checked only the wallet's SOL delta and the card mint's ATA
+// deltas. That left a hole: a build could bundle a legitimate swap with
+// an extra transfer and still pass. Now the simulation is requested
+// for EVERY writable account the transaction touches (plus the fee
+// payer and the canonical pool set), and every account's lamport /
+// token-balance change must be explainable by the approved trade.
+// ---------------------------------------------------------------------------
+
+// Per-account effects from aligned pre/post states. Token deltas are
+// only read from accounts OWNED by a token program — program accounts
+// (pool PDAs, hook state) change their data during a trade by design;
+// their lamports are what accounting watches.
+export function computeEffects(preStates, postStates, addresses) {
+  const effects = new Map();
+  addresses.forEach((addr, i) => {
+    const pre = preStates[i];
+    const post = postStates[i];
+    const lamportDelta = (post?.lamports ?? 0) - (pre?.lamports ?? 0);
+    let tokenDelta = 0n;
+    let tokenMint = null;
+    const ownerProgram = post?.owner ?? pre?.owner;
+    if (ownerProgram === TOKEN_PROGRAM || ownerProgram === TOKEN_2022_PROGRAM) {
+      const preTok = parseTokenAccountData(pre?.data);
+      const postTok = parseTokenAccountData(post?.data);
+      if (preTok || postTok) {
+        tokenMint = (postTok ?? preTok).mint;
+        tokenDelta = (postTok?.amount ?? 0n) - (preTok?.amount ?? 0n);
+      }
+    }
+    effects.set(addr, {
+      lamportDelta, tokenDelta, tokenMint,
+      preExists: !!pre, postExists: !!post,
+    });
+  });
+  return effects;
+}
+
+// P0-2: missing, partial, or malformed simulation state STOPS the
+// send. There is no pass-through: if any expected account's post-state
+// is absent, truncated away, or undecodable where token data is
+// expected, the send refuses with SIMULATION_STATE_MISSING.
+export function assertSimulationStatesComplete(preStates, postStates, addresses, tokenAccountAddrs) {
+  const refuse = (why) => {
+    throw new RuntimeError(
+      'SIMULATION_STATE_MISSING',
+      `refusing to broadcast: the mandatory signed-byte simulation did not return complete, decodable account states — ${why}. Delta verification is not optional; nothing was broadcast. Re-prepare and retry the send.`,
+    );
+  };
+  if (!Array.isArray(preStates) || preStates.length !== addresses.length) {
+    refuse(`pre-trade account states are incomplete (${Array.isArray(preStates) ? preStates.length : 'none'} of ${addresses.length} accounts)`);
+  }
+  if (!Array.isArray(postStates) || postStates.length !== addresses.length) {
+    refuse(`the simulation returned ${Array.isArray(postStates) ? postStates.length : 'no'} account states for ${addresses.length} requested accounts`);
+  }
+  addresses.forEach((addr, i) => {
+    const pre = preStates[i];
+    const post = postStates[i];
+    if (pre && !post) {
+      refuse(`account ${addr} existed before the trade but has no post-simulation state`);
+    }
+    if (!post) return;
+    const wasTokenData = pre && pre.data.length >= 72 && (pre.owner === TOKEN_PROGRAM || pre.owner === TOKEN_2022_PROGRAM);
+    if (post.data.length > 0 && post.data.length < 72 && (tokenAccountAddrs.has(addr) || wasTokenData)) {
+      refuse(`account ${addr} carries ${post.data.length} bytes of post-simulation data — not a decodable token account`);
+    }
+    if (wasTokenData && post.data.length >= 72 && !parseTokenAccountData(post.data)) {
+      refuse(`account ${addr} held a token account before the trade but its post-simulation data does not decode`);
+    }
+  });
+}
+
+// The permitted-effects set is derived from the card + canonical
+// record (tradeAccountSets): the wallet, the wallet's own ATAs for the
+// card mint, the wallet's own wrapped-SOL ATA (its lamports fold into
+// the wallet's aggregate SOL delta in sendCard — wrapped SOL is the
+// wallet's own SOL in transit, and a leftover balance is the wallet's
+// own position), and the canonical pool accounts (pool, its vaults).
+// Any OTHER account whose lamports or token balance move refuses with
+// UNEXPECTED_EFFECT; the pool side must additionally behave like the
+// trade's counterparty (it cannot gain tokens on a buy, cannot pay out
+// more SOL than the approved input, etc.). The wallet's own aggregate
+// bounds are enforced separately by enforceEconomicBounds.
+export function enforceFullEffects(card, effects, sets) {
+  const unexpected = (addr, what) => {
+    throw new RuntimeError(
+      'UNEXPECTED_EFFECT',
+      `refusing to broadcast: the signed-byte simulation moves value somewhere the card does not approve — ${what} (account ${addr}). The build does more than the approved trade. Discard it and prepare again.`,
+      { account: addr },
+    );
+  };
+  for (const [addr, eff] of effects) {
+    // The wallet's WSOL ATA may move its wrapped-SOL balance — that
+    // value is accounted in lamports against the wallet's aggregate.
+    const ownWsol = addr === sets.wsolAta && eff.tokenMint === WSOL_MINT;
+    if (eff.tokenDelta !== 0n && eff.tokenMint !== card.mint && !ownWsol) {
+      unexpected(addr, `a token balance for mint ${eff.tokenMint} changes by ${eff.tokenDelta} — not the card mint ${card.mint}`);
+    }
+    if (!sets.permitted.has(addr) && (eff.lamportDelta !== 0 || eff.tokenDelta !== 0n)) {
+      unexpected(addr, `an account outside the wallet / pool set changes by ${eff.lamportDelta} lamports and ${eff.tokenDelta} tokens`);
+    }
+  }
+  for (const ata of sets.walletAtas) {
+    const eff = effects.get(ata);
+    if (!eff) continue;
+    if (card.side === 'buy' && eff.tokenDelta < 0n) {
+      unexpected(ata, 'the wallet\u2019s own token account is DEBITED on a buy');
+    }
+    if (card.side === 'sell' && eff.tokenDelta > 0n) {
+      unexpected(ata, 'the wallet\u2019s own token account is CREDITED on a sell');
+    }
+    if (eff.lamportDelta < 0) {
+      unexpected(ata, 'the wallet\u2019s own token account pays lamports out — only ATA-creation rent may arrive in it');
+    }
+  }
+  const amountIn = BigInt(card.validation.amountInRaw);
+  const expectedOut = BigInt(card.validation.expectedAmountOutRaw);
+  const feeCeiling = BigInt(card.feeCeilingLamports);
+  for (const addr of sets.poolAccounts) {
+    const eff = effects.get(addr);
+    if (!eff) continue;
+    if (card.side === 'buy') {
+      if (eff.lamportDelta < 0) unexpected(addr, 'a pool account LOSES SOL on a buy — it is not behaving as the trade counterparty');
+      if (BigInt(eff.lamportDelta) > amountIn) unexpected(addr, `a pool account gains ${eff.lamportDelta} lamports, more than the approved trade input of ${amountIn}`);
+      if (eff.tokenDelta > 0n) unexpected(addr, 'a pool account GAINS the card token on a buy — value appearing from nowhere');
+    } else {
+      if (eff.lamportDelta > 0) unexpected(addr, 'a pool account GAINS SOL on a sell — it is not behaving as the trade counterparty');
+      if (BigInt(-eff.lamportDelta) > expectedOut + feeCeiling) unexpected(addr, `a pool account pays out ${-eff.lamportDelta} lamports, beyond the expected proceeds plus the fee ceiling`);
+      if (eff.tokenDelta < 0n) unexpected(addr, 'a pool account LOSES the card token on a sell — value disappearing to nowhere');
+    }
+  }
+}
+
 export function enforceEconomicBounds(card, deltas) {
   const { solDelta, tokenDelta } = deltas;
   const maxDebit = BigInt(card.maxSolDebitLamports);
@@ -859,7 +1108,7 @@ export async function sendCard(opts) {
     ? localKeypair.publicKey.toBase58()
     : external?.address;
   if (!signerAddress) {
-    throw new RuntimeError('INVALID_ARGS', 'send requires a signer: a local keypair (--file) or an external signer (--signer-type external --external-signer <command> --wallet <address>)');
+    throw new RuntimeError('INVALID_ARGS', 'send requires a signer: a local keypair (--file) or an external signer (--signer-type external --external-signer <executable-path> --wallet <address>)');
   }
 
   // 1. Approval must name THIS card's exact build.
@@ -972,12 +1221,13 @@ export async function sendCard(opts) {
   // 7. Sign the EXACT bytes from the card — locally, or via the external
   //    signer whose returned bytes are validated first.
   const unsignedBytes = Buffer.from(card.transactionBase64, 'base64');
-  const isVersioned = (unsignedBytes[0] & 0x80) !== 0;
+  const isVersioned = serializedTxKind(unsignedBytes).versioned;
   let signedBytes;
   let signedTx;
   let signature;
   if (external) {
     signedBytes = await runExternalSigner(external.command, card.transactionBase64, {
+      args: external.args ?? [],
       runCommand: external.runCommand,
     });
     await validateExternalSigned(unsignedBytes, signedBytes, signerAddress);
@@ -991,10 +1241,22 @@ export async function sendCard(opts) {
     signature = signatureOf(signedTx);
   }
 
-  // 8. MANDATORY simulation of the exact signed bytes (P0-2a), with the
-  //    economic bounds enforced from its account states (P0-1d). A
+  // 8. MANDATORY simulation of the exact signed bytes (P0-2a), with
+  //    FULL-EFFECT accounting over every writable account the
+  //    transaction touches (repair round 2, P0-1a): the wallet's
+  //    aggregate bounds (enforceEconomicBounds) AND the per-account
+  //    permitted-effects set (enforceFullEffects) are both enforced
+  //    from the simulation's account states. Incomplete or malformed
+  //    simulation state refuses (P0-2) — there is no pass-through. Any
   //    failure here means sendRawTransaction is never reached.
-  const addresses = economicAccountAddresses(signerAddress, card.mint);
+  const sets = tradeAccountSets({ wallet: signerAddress, mint: card.mint, tokenJson: opts.tokenJson });
+  const addresses = [...new Set([
+    ...(card.intent?.writableAccounts ?? []),
+    signerAddress,
+    ...sets.walletAtas,
+    sets.wsolAta,
+    ...sets.poolAccounts,
+  ])];
   const preStates = await fetchAccountStates(connection, fetchImpl, rpcUrl, addresses);
   const sim = await simulateSignedBytes({
     connection, fetchImpl, rpcUrl, signedBytes, signedTx, addresses,
@@ -1007,17 +1269,34 @@ export async function sendCard(opts) {
       { simulation: sim },
     );
   }
-  let deltas = null;
-  let economicBounds = 'enforced';
-  if (sim.accounts) {
-    deltas = computeDeltas(preStates, sim.accounts, addresses, signerAddress, card.mint);
-    enforceEconomicBounds(card, deltas);
-  } else {
-    economicBounds = 'unverifiable — the simulation returned no account states, so SOL/token deltas could not be enforced for this send';
-  }
-  const deltasOut = deltas
-    ? { solDelta: deltas.solDelta, tokenDelta: deltas.tokenDelta.toString() }
-    : null;
+  assertSimulationStatesComplete(
+    preStates, sim.accounts, addresses,
+    new Set([...sets.walletAtas, sets.wsolAta, ...sets.poolAccounts]),
+  );
+  const effects = computeEffects(preStates, sim.accounts, addresses);
+  // Aggregate SOL accounting: the wallet's own lamport delta PLUS its
+  // wrapped-SOL ATA's lamport delta. A WSOL ATA's lamports ARE its
+  // wrapped-SOL balance (SyncNative keeps them equal), so wrapped SOL
+  // still sitting in the wallet's own ATA is the wallet's own position
+  // — it reduces a buy's net debit / adds to a sell's credit. An ATA
+  // created and closed inside the trade nets to a 0 contribution (its
+  // lamports left via the swap and the close refund, both already in
+  // the wallet/pool deltas); a pre-existing ATA that ends closed has
+  // its negative delta exactly cancel the close credit inside the
+  // wallet's own delta. Either way the aggregate is the wallet's true
+  // SOL position change.
+  const deltas = {
+    solDelta: (effects.get(signerAddress)?.lamportDelta ?? 0)
+      + (effects.get(sets.wsolAta)?.lamportDelta ?? 0),
+    tokenDelta: sets.walletAtas.reduce((acc, a) => {
+      const e = effects.get(a);
+      return acc + (e && e.tokenMint === card.mint ? e.tokenDelta : 0n);
+    }, 0n),
+  };
+  enforceEconomicBounds(card, deltas);
+  enforceFullEffects(card, effects, sets);
+  const economicBounds = 'enforced';
+  const deltasOut = { solDelta: deltas.solDelta, tokenDelta: deltas.tokenDelta.toString() };
 
   if (opts.dryRun) {
     return {
