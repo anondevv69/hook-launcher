@@ -1,4 +1,19 @@
-// agentonly-runtime acceptance fixtures (15).
+// agentonly-runtime acceptance fixtures (24).
+//
+// Repair round 2 (PR #5 review) added: 16/17 malicious bundled builds
+// (extra SOL transfer / unrelated-token transfer → instruction
+// classification refuses at prepare), 18 simulation moving value to an
+// unexpected account (full-effect accounting refuses), 19 incomplete
+// simulation state (fail closed), 20 canonical data unavailable at
+// send, 21 a real v0 transaction with an address lookup table, 22
+// sidecar binding (copied sidecar / reformatted keypair file).
+//
+// Repair round 2.1 added: 23 the REAL gateway build shape — fee
+// distributor settles, WSOL ATA create, wrap transfer, SyncNative,
+// venue swap, WSOL close — classified + accounted end to end (the
+// round-2 classifier rejected every real build at the WSOL ATA
+// create), 24 the same shape with the wrap leg aimed at a stranger's
+// WSOL-lookalike ATA (refuses at prepare).
 //
 // Every key here is a fresh throwaway keypair generated inside a temp dir
 // by this script. Nothing is broadcast, ever: the only live-network calls
@@ -32,15 +47,20 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  AddressLookupTableAccount,
   ComputeBudgetProgram,
   Connection,
   Keypair,
+  MessageV0,
   PublicKey,
+  SystemProgram,
   Transaction,
   TransactionInstruction,
+  VersionedTransaction,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import {
+  WSOL_MINT,
   associatedTokenAddress,
   fingerprintOf,
   parseStrictDecimal,
@@ -87,7 +107,7 @@ function runCli(args, { cwd, env } = {}) {
 // ---------------------------------------------------------------------------
 // Intent-valid trade-shaped transaction builder
 // ---------------------------------------------------------------------------
-function buildTradeTx({ kp, mint, pool, blockhash, lvbh }) {
+function buildTradeTx({ kp, mint, pool, blockhash, lvbh, extraKeys = [] }) {
   const wallet = kp.publicKey;
   const mintPk = new PublicKey(mint);
   const ata = associatedTokenAddress(mintPk, wallet, TOKEN_2022_PROGRAM);
@@ -100,6 +120,7 @@ function buildTradeTx({ kp, mint, pool, blockhash, lvbh }) {
       { pubkey: new PublicKey(pool), isSigner: false, isWritable: true },
       { pubkey: mintPk, isSigner: false, isWritable: false },
       { pubkey: ata, isSigner: false, isWritable: true },
+      ...extraKeys,
     ],
     data: Buffer.from([1]),
   }));
@@ -261,7 +282,9 @@ console.log(`fixtures workspace: ${tmp} (throwaway keys only; removed at the end
   // Un-attested runtime-created wallet: prepare must refuse before network.
   const gated = await runCli(['prepare', '--file', file, '--mint', AGTR, '--side', 'buy', '--amount', '0.01'], { cwd: tmp });
   const attest = await runCli(['wallet', 'attest-persistence', '--file', file], { cwd: tmp });
-  const attestedAt = sidecarExists ? JSON.parse(readFileSync(sidecarPath, 'utf8')).attestedAt : null;
+  const sidecarParsed = sidecarExists ? JSON.parse(readFileSync(sidecarPath, 'utf8')) : {};
+  const attestedAt = sidecarParsed.attestedAt ?? null;
+  const bound = typeof sidecarParsed.keypairSha256 === 'string' && sidecarParsed.keypairSha256.length === 64;
   // Exclusive creation: a second create over the same path must refuse.
   const dupe = await runCli(['wallet', 'create', '--file', file], { cwd: tmp });
   const ok = create.code === 0
@@ -271,13 +294,13 @@ console.log(`fixtures workspace: ${tmp} (throwaway keys only; removed at the end
     && existsSync(file)
     && sidecarExists
     && gated.code !== 0 && gated.out.includes('WALLET_NOT_ATTESTED')
-    && attest.code === 0 && !!attestedAt
+    && attest.code === 0 && !!attestedAt && bound
     && dupe.code !== 0 && dupe.out.includes('KEYPAIR_EXISTS');
   report(1, 'persistent local signer (create → handshake → sidecar → attestation gate → show)', ok, [
     `create exit=${create.code}, handshake line present=${create.stdout.includes('persistence handshake: OK')}`,
     `address from create: ${addr}; from show (separate process): ${show.stdout.trim()}`,
     `sidecar written=${sidecarExists}; prepare before attestation: exit=${gated.code} code=${gated.out.includes('WALLET_NOT_ATTESTED') ? 'WALLET_NOT_ATTESTED' : 'MISSING'}`,
-    `attest exit=${attest.code}, sidecar attestedAt=${attestedAt}`,
+    `attest exit=${attest.code}, sidecar attestedAt=${attestedAt}, keypair binding present=${bound}`,
     `second create over same path: exit=${dupe.code} (KEYPAIR_EXISTS=${dupe.out.includes('KEYPAIR_EXISTS')})`,
   ]);
 }
@@ -562,12 +585,23 @@ function craftCard(wallet, txB64, lvbh) {
     buf.writeBigUInt64LE(BigInt(amount), 64);
     return buf;
   };
-  const preFor = (addr) => (addr === wallet
-    ? { lamports: 100_000_000, data: Buffer.alloc(0), owner: new PublicKey('11111111111111111111111111111111'), executable: false, rentEpoch: 0 }
-    : { lamports: 2_039_280, data: tokenBlob(0), owner: new PublicKey(TOKEN_2022_PROGRAM), executable: false, rentEpoch: 0 });
-  const postFor = (addr) => (addr === wallet
-    ? { lamports: 100_000_000 - 10_005_000, data: Buffer.alloc(0), owner: new PublicKey('11111111111111111111111111111111'), executable: false, rentEpoch: 0 }
-    : { lamports: 2_039_280, data: tokenBlob(500), owner: new PublicKey(TOKEN_2022_PROGRAM), executable: false, rentEpoch: 0 });
+  // Address-aware states (repair round 2): full-effect accounting reads
+  // EVERY writable account, so the double must model the pool as the
+  // counterparty (gains the SOL input, pays out of its own side) rather
+  // than crediting every account +500 tokens.
+  const ata12 = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const preFor = (addr) => {
+    if (addr === wallet) return { lamports: 100_000_000, data: Buffer.alloc(0), owner: new PublicKey('11111111111111111111111111111111'), executable: false, rentEpoch: 0 };
+    if (addr === ata12) return { lamports: 2_039_280, data: tokenBlob(0), owner: new PublicKey(TOKEN_2022_PROGRAM), executable: false, rentEpoch: 0 };
+    if (addr === AGTR_POOL) return { lamports: 5_000_000, data: Buffer.alloc(0), owner: new PublicKey(DBC_PROGRAM), executable: false, rentEpoch: 0 };
+    return null;
+  };
+  const postFor = (addr) => {
+    if (addr === wallet) return { lamports: 100_000_000 - 10_005_000, data: Buffer.alloc(0), owner: new PublicKey('11111111111111111111111111111111'), executable: false, rentEpoch: 0 };
+    if (addr === ata12) return { lamports: 2_039_280, data: tokenBlob(500), owner: new PublicKey(TOKEN_2022_PROGRAM), executable: false, rentEpoch: 0 };
+    if (addr === AGTR_POOL) return { lamports: 5_000_000 + 10_000_000, data: Buffer.alloc(0), owner: new PublicKey(DBC_PROGRAM), executable: false, rentEpoch: 0 };
+    return null;
+  };
   let confirmArg = null; let rawSends = 0;
   const fakeSig = Keypair.generate().publicKey.toBase58();
   const conn = {
@@ -661,23 +695,35 @@ process.stdin.on('end', () => {
   const card = existsSync(cardPath) ? JSON.parse(readFileSync(cardPath, 'utf8')) : null;
   let ok = false; const lines = [`external prepare exit=${prep.code}, card written=${!!card}`];
   if (card) {
+    // Repair round 2 interface: --external-signer is a plain executable
+    // PATH (here: this process's own node binary); the script and its
+    // keyfile arrive as structured --external-signer-arg argv. No shell.
     const good = await runCli(
-      ['send', '--signer-type', 'external', '--external-signer', `node ${signerGood} ${keyFile}`, '--wallet', wallet, '--card', cardPath, '--approve', card.fingerprint, '--dry-run'],
+      ['send', '--signer-type', 'external', '--external-signer', process.execPath, '--external-signer-arg', signerGood, '--external-signer-arg', keyFile, '--wallet', wallet, '--card', cardPath, '--approve', card.fingerprint, '--dry-run'],
       { cwd: dir, env },
     );
     lines.push(`good signer dry-run exit=${good.code}`);
     const evil = await runCli(
-      ['send', '--signer-type', 'external', '--external-signer', `node ${signerEvil} ${keyFile}`, '--wallet', wallet, '--card', cardPath, '--approve', card.fingerprint, '--dry-run'],
+      ['send', '--signer-type', 'external', '--external-signer', process.execPath, '--external-signer-arg', signerEvil, '--external-signer-arg', keyFile, '--wallet', wallet, '--card', cardPath, '--approve', card.fingerprint, '--dry-run'],
       { cwd: dir, env },
     );
     lines.push(`message-altering signer exit=${evil.code}, code=${evil.out.includes('EXTERNAL_SIGNER_MISMATCH') ? 'EXTERNAL_SIGNER_MISMATCH' : 'MISSING'}`);
     lines.push(`evil message: ${evil.out.trim().split('\n')[0].slice(0, 160)}…`);
-    ok = good.code === 0 && good.out.includes('DRY RUN') && evil.code !== 0 && evil.out.includes('EXTERNAL_SIGNER_MISMATCH');
+    // A shell-string signer ("node script key") must be refused as an
+    // invalid executable path before any spawn.
+    const shellForm = await runCli(
+      ['send', '--signer-type', 'external', '--external-signer', `node ${signerGood} ${keyFile}`, '--wallet', wallet, '--card', cardPath, '--approve', card.fingerprint, '--dry-run'],
+      { cwd: dir, env },
+    );
+    lines.push(`shell-string signer exit=${shellForm.code}, code=${shellForm.out.includes('EXTERNAL_SIGNER_INVALID') ? 'EXTERNAL_SIGNER_INVALID' : 'MISSING'}`);
+    ok = good.code === 0 && good.out.includes('DRY RUN')
+      && evil.code !== 0 && evil.out.includes('EXTERNAL_SIGNER_MISMATCH')
+      && shellForm.code !== 0 && shellForm.out.includes('EXTERNAL_SIGNER_INVALID');
   } else {
     lines.push(`prepare output: ${prep.out.trim().split('\n')[0]}`);
   }
   stub.server.close();
-  report(13, 'external signer — stdin/stdout protocol works; altered message refused', ok, lines);
+  report(13, 'external signer — shell-free executable + structured args; altered message and shell-string refused', ok, lines);
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +777,557 @@ process.stdin.on('end', () => {
   lines.push(`CLI prepare --amount 1e-3: exit=${r.code}, gateway requests=${stub.counts.gateway} (must be 0)`);
   const ok = allRejected && goodOk && r.code !== 0 && r.out.includes('INVALID_AMOUNT') && stub.counts.gateway === 0;
   report(15, 'strict amounts — exponent/negative/garbage/over-precision rejected', ok, lines);
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures 16 + 17 — malicious bundled builds (repair round 2, P0-1b).
+// A legitimate swap with an extra transfer bundled in must fail
+// INSTRUCTION CLASSIFICATION at prepare: the card never exists, so
+// nothing can ever be signed or broadcast.
+// ---------------------------------------------------------------------------
+{
+  const { blockhash, lvbh } = await liveBlockhash();
+
+  // Fixture 16 — valid AGTR buy + extra System transfer of 0.5 SOL
+  // from the wallet to a stranger.
+  {
+    const kp = Keypair.generate();
+    const dir = join(tmp, 'f16'); mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'w.keypair.json'); writeKeypairFile(file, kp);
+    const state = makeTradeState(kp, blockhash, lvbh);
+    const stranger = Keypair.generate().publicKey;
+    const badTx = buildTradeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+    badTx.add(SystemProgram.transfer({ fromPubkey: kp.publicKey, toPubkey: stranger, lamports: 500_000_000 }));
+    state.build = { ...state.build, transaction_base64: badTx.serialize({ requireAllSignatures: false }).toString('base64') };
+    const stub = await startStub(state);
+    const cardPath = join(dir, 'approval-card.json');
+    const r = await runCli(
+      ['prepare', '--file', file, '--mint', AGTR, '--side', 'buy', '--amount', '0.01', '--out', cardPath],
+      { cwd: dir, env: { AGENTONLY_GATEWAY_BASE: stub.url, AGENTONLY_RPC_URL: stub.url } },
+    );
+    stub.server.close();
+    const ok = r.code !== 0 && r.out.includes('UNCLASSIFIED_INSTRUCTION') && !existsSync(cardPath) && stub.counts.sendTransaction === 0;
+    report(16, 'malicious bundle: swap + extra 0.5 SOL transfer to a stranger — classification refuses at prepare', ok, [
+      `prepare exit=${r.code}, card written=${existsSync(cardPath)} (must be false), sendTransaction calls=${stub.counts.sendTransaction} (must be 0)`,
+      `message: ${r.out.trim().split('\n')[0].slice(0, 200)}…`,
+    ]);
+  }
+
+  // Fixture 17 — valid buy + transfer of an UNRELATED token out of the
+  // wallet's other-mint ATA.
+  {
+    const kp = Keypair.generate();
+    const dir = join(tmp, 'f17'); mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'w.keypair.json'); writeKeypairFile(file, kp);
+    const state = makeTradeState(kp, blockhash, lvbh);
+    const otherMint = Keypair.generate().publicKey;
+    const stranger = Keypair.generate().publicKey;
+    const srcAta = associatedTokenAddress(otherMint, kp.publicKey, TOKEN_2022_PROGRAM);
+    const dstAta = associatedTokenAddress(otherMint, stranger, TOKEN_2022_PROGRAM);
+    const data = Buffer.alloc(9);
+    data[0] = 3; // Token Transfer
+    data.writeBigUInt64LE(1000n, 1);
+    const badTx = buildTradeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+    badTx.add(new TransactionInstruction({
+      programId: new PublicKey(TOKEN_2022_PROGRAM),
+      keys: [
+        { pubkey: srcAta, isSigner: false, isWritable: true },
+        { pubkey: dstAta, isSigner: false, isWritable: true },
+        { pubkey: kp.publicKey, isSigner: true, isWritable: false },
+      ],
+      data,
+    }));
+    state.build = { ...state.build, transaction_base64: badTx.serialize({ requireAllSignatures: false }).toString('base64') };
+    const stub = await startStub(state);
+    const cardPath = join(dir, 'approval-card.json');
+    const r = await runCli(
+      ['prepare', '--file', file, '--mint', AGTR, '--side', 'buy', '--amount', '0.01', '--out', cardPath],
+      { cwd: dir, env: { AGENTONLY_GATEWAY_BASE: stub.url, AGENTONLY_RPC_URL: stub.url } },
+    );
+    stub.server.close();
+    const ok = r.code !== 0 && r.out.includes('UNCLASSIFIED_INSTRUCTION') && !existsSync(cardPath) && stub.counts.sendTransaction === 0;
+    report(17, 'malicious bundle: swap + unrelated-token transfer — classification refuses at prepare', ok, [
+      `prepare exit=${r.code}, card written=${existsSync(cardPath)} (must be false), sendTransaction calls=${stub.counts.sendTransaction} (must be 0)`,
+      `message: ${r.out.trim().split('\n')[0].slice(0, 200)}…`,
+    ]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Library-level double harness for fixtures 18, 19, 21 — a plain-object
+// connection whose account states model a real buy counterparty:
+// wallet pays 10,005,000 lamports, its ATA gains 500 AGTR, the pool
+// gains the 10,000,000-lamport input.
+// ---------------------------------------------------------------------------
+function stdTokenBlob(mintB58, ownerB58, amount) {
+  const buf = Buffer.alloc(165);
+  buf.set(bs58.decode(mintB58), 0);
+  buf.set(bs58.decode(ownerB58), 32);
+  buf.writeBigUInt64LE(BigInt(amount), 64);
+  return buf;
+}
+function acctState(lamports, data, owner) {
+  return { lamports, data, owner, executable: false, rentEpoch: 0 };
+}
+function buyStateFns({ wallet, ata, pool, extraPre = {}, extraPost = {} }) {
+  const SYS = new PublicKey('11111111111111111111111111111111');
+  const T22 = new PublicKey(TOKEN_2022_PROGRAM);
+  const preFor = (addr) => {
+    if (addr in extraPre) return extraPre[addr];
+    if (addr === wallet) return acctState(100_000_000, Buffer.alloc(0), SYS);
+    if (addr === ata) return acctState(2_039_280, stdTokenBlob(AGTR, wallet, 0), T22);
+    if (addr === pool) return acctState(5_000_000, Buffer.alloc(0), new PublicKey(DBC_PROGRAM));
+    return null;
+  };
+  const postFor = (addr) => {
+    if (addr in extraPost) return extraPost[addr];
+    if (addr === wallet) return acctState(100_000_000 - 10_005_000, Buffer.alloc(0), SYS);
+    if (addr === ata) return acctState(2_039_280, stdTokenBlob(AGTR, wallet, 500), T22);
+    if (addr === pool) return acctState(5_000_000 + 10_000_000, Buffer.alloc(0), new PublicKey(DBC_PROGRAM));
+    return null;
+  };
+  return { preFor, postFor };
+}
+function makeDoubleConn({ preFor, postFor, blockHeight, altAccount = null }) {
+  let rawSends = 0;
+  const conn = {
+    rpcEndpoint: 'stub://double',
+    getBalance: async () => 100_000_000,
+    getBlockHeight: async () => blockHeight,
+    getMultipleAccountsInfo: async (keys) => keys.map((k) => preFor(k.toBase58())),
+    simulateTransaction: async (txArg, cfg) => ({
+      value: { err: null, unitsConsumed: 150, logs: [], accounts: (cfg?.accounts?.addresses ?? []).map(postFor) },
+    }),
+    sendRawTransaction: async () => { rawSends++; return Keypair.generate().publicKey.toBase58(); },
+    confirmTransaction: async () => ({ value: { err: null } }),
+    getTokenAccountsByOwner: async () => ({ value: [] }),
+  };
+  if (altAccount) conn.getAddressLookupTable = async () => ({ value: altAccount });
+  return { conn, rawSends: () => rawSends };
+}
+function makeGwFetch(build) {
+  return async (url) => {
+    const u = String(url);
+    const mk = (obj) => ({ ok: true, status: 200, json: async () => obj });
+    if (u.includes('/v1/trade/eligibility')) return mk({ ok: true, status: 'eligible', reasons: [] });
+    if (u.includes('/v1/trade/quote')) return mk({ ok: true, venue: 'curve', amountIn: '10000000', amountOut: '500', minimumAmountOut: '495', fees: { total: '0' }, priceImpactBps: 0, symbol: 'AGTR' });
+    if (u.includes('/v1/trade/build')) return mk({ ok: true, ...build });
+    throw new Error(`double harness: unexpected fetch ${u}`);
+  };
+}
+function stubBuild(txB64, blockhash, lvbh) {
+  return {
+    status: 'ready_for_signature', symbol: 'AGTR', venue: 'curve',
+    amount_in: '10000000', amount_out_expected: '500', minimum_amount_out: '495', price_impact_bps: 0,
+    bundled: [], transaction_base64: txB64, blockhash, last_valid_block_height: lvbh,
+    simulation: { status: 'passed', layer: 'none', unitsConsumed: 150, provisional: true, note: 'stub' },
+  };
+}
+const TOKEN_JSON_STUB = { mint: AGTR, symbol: 'AGTR', decimals: 6, addresses: { pool: AGTR_POOL } };
+
+// ---------------------------------------------------------------------------
+// Fixture 18 — simulation moves value to an unexpected third account
+// (repair round 2, P0-1a). The transaction bytes themselves are
+// intent-valid (an extra writable account rides in the venue
+// instruction), but its post-simulation balance grows — full-effect
+// accounting must refuse before broadcast.
+// ---------------------------------------------------------------------------
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const impostor = Keypair.generate().publicKey.toBase58();
+  const SYS = new PublicKey('11111111111111111111111111111111');
+  const tx = buildTradeTx({
+    kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh,
+    extraKeys: [{ pubkey: new PublicKey(impostor), isSigner: false, isWritable: true }],
+  });
+  const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+  const ata = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const { preFor, postFor } = buyStateFns({
+    wallet, ata, pool: AGTR_POOL,
+    extraPost: { [impostor]: acctState(1_000_000, Buffer.alloc(0), SYS) },
+  });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+  const gwFetch = makeGwFetch(stubBuild(txB64, blockhash, lvbh));
+  let ok = false; const lines = [];
+  try {
+    const card = await prepareTrade({
+      wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own',
+      fetchImpl: gwFetch, connection: conn, tokenJson: TOKEN_JSON_STUB,
+    });
+    lines.push('prepare accepted the intent-valid build (extra writable account is not, by itself, a classification failure)');
+    await sendCard({ keypair: kp, card, approve: card.fingerprint, connection: conn, fetchImpl: gwFetch, tokenJson: TOKEN_JSON_STUB });
+    lines.push('sendCard DID NOT throw — full-effect accounting failed to catch the impostor credit');
+  } catch (e) {
+    ok = e.code === 'UNEXPECTED_EFFECT' && rawSends() === 0;
+    lines.push(`send threw ${e.code ?? ''}: ${e.message.slice(0, 180)}…`);
+    lines.push(`sendRawTransaction calls=${rawSends()} (must be 0)`);
+  }
+  report(18, 'unexpected third account gains lamports in simulation — UNEXPECTED_EFFECT, nothing broadcast', ok, lines);
+}
+
+// ---------------------------------------------------------------------------
+// Fixture 19 — simulation returns incomplete account states (repair
+// round 2, P0-2): the send must fail closed, never broadcast.
+// ---------------------------------------------------------------------------
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const tx = buildTradeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+  const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+  const ata = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const { preFor, postFor } = buyStateFns({ wallet, ata, pool: AGTR_POOL });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+  const goodSim = conn.simulateTransaction;
+  conn.simulateTransaction = async (txArg, cfg) => {
+    const r = await goodSim(txArg, cfg);
+    r.value.accounts = r.value.accounts.slice(0, -1); // one expected account's state goes missing
+    return r;
+  };
+  const gwFetch = makeGwFetch(stubBuild(txB64, blockhash, lvbh));
+  let ok = false; const lines = [];
+  try {
+    const card = await prepareTrade({
+      wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own',
+      fetchImpl: gwFetch, connection: conn, tokenJson: TOKEN_JSON_STUB,
+    });
+    await sendCard({ keypair: kp, card, approve: card.fingerprint, connection: conn, fetchImpl: gwFetch, tokenJson: TOKEN_JSON_STUB });
+    lines.push('sendCard DID NOT throw — missing simulation state was allowed through');
+  } catch (e) {
+    ok = e.code === 'SIMULATION_STATE_MISSING' && rawSends() === 0;
+    lines.push(`send threw ${e.code ?? ''}: ${e.message.slice(0, 180)}…`);
+    lines.push(`sendRawTransaction calls=${rawSends()} (must be 0)`);
+  }
+  report(19, 'simulation state incomplete — SIMULATION_STATE_MISSING fails closed, nothing broadcast', ok, lines);
+}
+
+// ---------------------------------------------------------------------------
+// Fixture 20 — canonical token data unavailable at SEND time (repair
+// round 2, P1-d): the CLI used to treat the record as best-effort and
+// skip pool validation. Now the send refuses before signing.
+// ---------------------------------------------------------------------------
+{
+  const kp = Keypair.generate();
+  const dir = join(tmp, 'f20'); mkdirSync(dir, { recursive: true });
+  const file = join(dir, 'w.keypair.json'); writeKeypairFile(file, kp);
+  const { blockhash, lvbh } = await liveBlockhash();
+  const state = makeTradeState(kp, blockhash, lvbh);
+  const stub = await startStub(state);
+  const cardPath = join(dir, 'approval-card.json');
+  const prep = await runCli(
+    ['prepare', '--file', file, '--mint', AGTR, '--side', 'buy', '--amount', '0.01', '--out', cardPath],
+    { cwd: dir, env: { AGENTONLY_GATEWAY_BASE: stub.url, AGENTONLY_RPC_URL: stub.url } },
+  );
+  const card = existsSync(cardPath) ? JSON.parse(readFileSync(cardPath, 'utf8')) : null;
+  let ok = false; const lines = [`prepare exit=${prep.code}, card written=${!!card}`];
+  if (card) {
+    // Point the SITE base at the stub, which 404s the token record.
+    const r = await runCli(
+      ['send', '--file', file, '--card', cardPath, '--approve', card.fingerprint, '--dry-run'],
+      { cwd: dir, env: { AGENTONLY_GATEWAY_BASE: stub.url, AGENTONLY_RPC_URL: stub.url, AGENTONLY_SITE_BASE: stub.url } },
+    );
+    lines.push(`send exit=${r.code}, code=${r.out.includes('CANONICAL_DATA_UNAVAILABLE') ? 'CANONICAL_DATA_UNAVAILABLE' : 'MISSING'}, sendTransaction calls=${stub.counts.sendTransaction} (must be 0)`);
+    lines.push(`message: ${r.out.trim().split('\n')[0].slice(0, 200)}…`);
+    ok = r.code !== 0 && r.out.includes('CANONICAL_DATA_UNAVAILABLE') && stub.counts.sendTransaction === 0;
+  }
+  stub.server.close();
+  report(20, 'canonical data unavailable at send — CANONICAL_DATA_UNAVAILABLE before signing', ok, lines);
+}
+
+// ---------------------------------------------------------------------------
+// Fixture 21 — a REAL v0 transaction with an address lookup table
+// (repair round 2, P1-f). Its serialized blob starts with the
+// signature-count shortvec (0x01), not the version flag — the old
+// byte-0 sniff misread it as legacy. Decode + intent validation +
+// dry-run must all work through the ALT.
+// ---------------------------------------------------------------------------
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const mintPk = new PublicKey(AGTR);
+  const poolPk = new PublicKey(AGTR_POOL);
+  const ataPk = associatedTokenAddress(mintPk, kp.publicKey, TOKEN_2022_PROGRAM);
+  const altAccount = new AddressLookupTableAccount({
+    key: Keypair.generate().publicKey,
+    state: {
+      deactivationSlot: 0,
+      lastExtendedSlot: 0,
+      lastExtendedSlotStartIndex: 0,
+      authority: undefined,
+      addresses: [poolPk, mintPk, ataPk],
+    },
+  });
+  const msg = MessageV0.compile({
+    payerKey: kp.publicKey,
+    recentBlockhash: blockhash,
+    addressLookupTableAccounts: [altAccount],
+    instructions: [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+      new TransactionInstruction({
+        programId: new PublicKey(DBC_PROGRAM),
+        keys: [
+          { pubkey: kp.publicKey, isSigner: true, isWritable: true },
+          { pubkey: poolPk, isSigner: false, isWritable: true },
+          { pubkey: mintPk, isSigner: false, isWritable: false },
+          { pubkey: ataPk, isSigner: false, isWritable: true },
+        ],
+        data: Buffer.from([1]),
+      }),
+      new TransactionInstruction({
+        programId: new PublicKey(MEMO_PROGRAM),
+        keys: [],
+        data: Buffer.from('agentonly-runtime fixture v0'),
+      }),
+    ],
+  });
+  const vtx = new VersionedTransaction(msg);
+  const rawBytes = Buffer.from(vtx.serialize());
+  const txB64 = rawBytes.toString('base64');
+  const ata = ataPk.toBase58();
+  const { preFor, postFor } = buyStateFns({ wallet, ata, pool: AGTR_POOL });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1, altAccount });
+  const gwFetch = makeGwFetch(stubBuild(txB64, blockhash, lvbh));
+  let ok = false; const lines = [
+    `serialized v0 blob: first byte=0x${rawBytes[0].toString(16)} (signature-count shortvec — the version flag lives in the message header, after the signatures)`,
+  ];
+  try {
+    const card = await prepareTrade({
+      wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own',
+      fetchImpl: gwFetch, connection: conn, tokenJson: TOKEN_JSON_STUB,
+    });
+    const result = await sendCard({
+      keypair: kp, card, approve: card.fingerprint, dryRun: true,
+      connection: conn, fetchImpl: gwFetch, tokenJson: TOKEN_JSON_STUB,
+    });
+    const intentOk = card.intent?.version === '0'
+      && card.intent.writableAccounts.includes(AGTR_POOL)
+      && card.intent.writableAccounts.includes(ata);
+    ok = intentOk && result.mode === 'dry-run' && rawSends() === 0;
+    lines.push(
+      `intent version=${card.intent?.version} (must be '0'), ALT-resolved pool writable=${card.intent?.writableAccounts.includes(AGTR_POOL)}, ATA writable=${card.intent?.writableAccounts.includes(ata)}`,
+      `dry-run result mode=${result.mode}, deltas=${JSON.stringify(result.deltas)}, sendRawTransaction calls=${rawSends()} (must be 0)`,
+    );
+  } catch (e) {
+    lines.push(`threw ${e.code ?? ''}: ${e.message.slice(0, 200)}`);
+  }
+  report(21, 'real v0 transaction + address lookup table — decode, intent validation, dry-run', ok, lines);
+}
+
+// ---------------------------------------------------------------------------
+// Fixture 22 — sidecar binding (repair round 2, P1-g): a sidecar copied
+// from another wallet refuses, and so does a keypair file whose bytes
+// changed after attestation (same key, reformatted JSON).
+// ---------------------------------------------------------------------------
+{
+  const stub = await startStub({ balanceLamports: 0, blockHeight: 1, quoteVenue: 'curve', eligibility: {}, quote: {}, build: {} });
+  const env = { AGENTONLY_GATEWAY_BASE: stub.url, AGENTONLY_RPC_URL: stub.url };
+  const lines = [];
+  let ok = true;
+  const mkWallet = async (name) => {
+    const dir = join(tmp, name); mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'w.keypair.json');
+    const c = await runCli(['wallet', 'create', '--file', file], { cwd: dir });
+    const a = await runCli(['wallet', 'attest-persistence', '--file', file], { cwd: dir });
+    if (c.code !== 0 || a.code !== 0) throw new Error(`wallet setup failed for ${name}`);
+    return { dir, file };
+  };
+  try {
+    const A = await mkWallet('f22a');
+    const B = await mkWallet('f22b');
+    // Copy A's sidecar over B's: prepares/sends on B must refuse.
+    writeFileSync(`${B.file}.agentonly.json`, readFileSync(`${A.file}.agentonly.json`, 'utf8'));
+    chmodSync(`${B.file}.agentonly.json`, 0o600);
+    const prepB = await runCli(['prepare', '--file', B.file, '--mint', AGTR, '--side', 'buy', '--amount', '0.01'], { cwd: B.dir, env });
+    const copiedOk = prepB.code !== 0 && prepB.out.includes('SIDECAR_BINDING_MISMATCH');
+    lines.push(`copied sidecar: prepare exit=${prepB.code}, code=${prepB.out.includes('SIDECAR_BINDING_MISMATCH') ? 'SIDECAR_BINDING_MISMATCH' : 'MISSING'}`);
+    ok = ok && copiedOk;
+
+    // Reformat C's keypair file (same key bytes semantically, different
+    // file bytes): the hash binding must refuse.
+    const C = await mkWallet('f22c');
+    const arr = JSON.parse(readFileSync(C.file, 'utf8'));
+    const showBefore = await runCli(['wallet', 'show', '--file', C.file], { cwd: C.dir });
+    writeFileSync(C.file, JSON.stringify(arr, null, 2));
+    chmodSync(C.file, 0o600);
+    const showAfter = await runCli(['wallet', 'show', '--file', C.file], { cwd: C.dir });
+    const prepC = await runCli(['prepare', '--file', C.file, '--mint', AGTR, '--side', 'buy', '--amount', '0.01'], { cwd: C.dir, env });
+    const reformatOk = showAfter.stdout.trim() === showBefore.stdout.trim()
+      && prepC.code !== 0 && prepC.out.includes('SIDECAR_BINDING_MISMATCH');
+    lines.push(`reformatted keypair file: same address derives (${showAfter.stdout.trim() === showBefore.stdout.trim()}), prepare exit=${prepC.code}, code=${prepC.out.includes('SIDECAR_BINDING_MISMATCH') ? 'SIDECAR_BINDING_MISMATCH' : 'MISSING'}`);
+    ok = ok && reformatOk;
+  } catch (e) {
+    ok = false;
+    lines.push(`setup failure: ${e.message}`);
+  }
+  stub.server.close();
+  report(22, 'sidecar binding — copied sidecar and reformatted keypair file both refused', ok, lines);
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures 23 + 24 — the REAL gateway build shape (repair round 2.1).
+// A live AGTR buy build from the production gateway decodes to:
+// ComputeBudget limit → fee distributor settle ×2 → ATA create (the
+// wallet's WSOL ATA) → System transfer wallet→WSOL ATA (the wrap) →
+// SyncNative → Meteora DBC swap → CloseAccount on the WSOL ATA (the
+// unwrap). The round-2 classifier refused this at the ATA create.
+// ---------------------------------------------------------------------------
+const DIST_PROGRAM = 'DpRjnQiywdJTUSWBvsJ1vj2mdvvCEDFzAStZJtL1tCQa';
+const ATA_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+
+function buildRealShapeTx({ kp, mint, pool, blockhash, lvbh, wrapDestination = null }) {
+  const wallet = kp.publicKey;
+  const mintPk = new PublicKey(mint);
+  const wsolPk = new PublicKey(WSOL_MINT);
+  const wsolAta = associatedTokenAddress(wsolPk, wallet, TOKEN_PROGRAM_ID);
+  const cardAta = associatedTokenAddress(mintPk, wallet, TOKEN_2022_PROGRAM);
+  const wrapTo = wrapDestination ?? wsolAta;
+  const tx = new Transaction({ feePayer: wallet, blockhash, lastValidBlockHeight: lvbh });
+  // 1. ComputeBudget: set unit limit
+  tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }));
+  // 2 + 3. AgentOnly fee distributor settles (wallet + mint)
+  for (let i = 0; i < 2; i++) {
+    tx.add(new TransactionInstruction({
+      programId: new PublicKey(DIST_PROGRAM),
+      keys: [
+        { pubkey: wallet, isSigner: true, isWritable: true },
+        { pubkey: mintPk, isSigner: false, isWritable: false },
+      ],
+      data: Buffer.from([7]),
+    }));
+  }
+  // 4. ATA create (idempotent) for the wallet's WSOL ATA
+  tx.add(new TransactionInstruction({
+    programId: new PublicKey(ATA_PROGRAM_ID),
+    keys: [
+      { pubkey: wallet, isSigner: true, isWritable: true },
+      { pubkey: wsolAta, isSigner: false, isWritable: true },
+      { pubkey: wallet, isSigner: false, isWritable: false },
+      { pubkey: wsolPk, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(TOKEN_PROGRAM_ID), isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from([1]), // CreateIdempotent
+  }));
+  // 5. Wrap leg: System transfer of the trade SOL into the WSOL ATA
+  tx.add(SystemProgram.transfer({ fromPubkey: wallet, toPubkey: wrapTo, lamports: 10_000_000 }));
+  // 6. SyncNative on the WSOL ATA
+  tx.add(new TransactionInstruction({
+    programId: new PublicKey(TOKEN_PROGRAM_ID),
+    keys: [{ pubkey: wsolAta, isSigner: false, isWritable: true }],
+    data: Buffer.from([17]),
+  }));
+  // 7. Venue swap — Meteora DBC, touching WSOL ATA + card ATA + pool
+  tx.add(new TransactionInstruction({
+    programId: new PublicKey(DBC_PROGRAM),
+    keys: [
+      { pubkey: wallet, isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(pool), isSigner: false, isWritable: true },
+      { pubkey: mintPk, isSigner: false, isWritable: false },
+      { pubkey: wsolAta, isSigner: false, isWritable: true },
+      { pubkey: cardAta, isSigner: false, isWritable: true },
+      { pubkey: wsolPk, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from([1]),
+  }));
+  // 8. Unwrap: close the WSOL ATA, lamports back to the wallet
+  tx.add(new TransactionInstruction({
+    programId: new PublicKey(TOKEN_PROGRAM_ID),
+    keys: [
+      { pubkey: wsolAta, isSigner: false, isWritable: true },
+      { pubkey: wallet, isSigner: false, isWritable: true },
+      { pubkey: wallet, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from([9]), // CloseAccount
+  }));
+  return { tx, wsolAta, cardAta };
+}
+
+// ---------------------------------------------------------------------------
+// Fixture 23 — real build shape end to end: prepare classifies it, the
+// dry-run send accounts it. Lamport story (buyStateFns): the wallet
+// pays fee 5,000 + ATA rent 2,039,280 + wrap 10,000,000 and gets the
+// 2,039,280 close refund back → net −10,005,000; the WSOL ATA is
+// created and closed inside the trade (pre/post both nonexistent →
+// contribution 0); the pool gains the 10,000,000 input; the wallet's
+// card ATA gains 500 tokens.
+// ---------------------------------------------------------------------------
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const { tx, cardAta } = buildRealShapeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+  const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+  const { preFor, postFor } = buyStateFns({ wallet, ata: cardAta.toBase58(), pool: AGTR_POOL });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+  const gwFetch = makeGwFetch(stubBuild(txB64, blockhash, lvbh));
+  let ok = false; const lines = [];
+  try {
+    const card = await prepareTrade({
+      wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own',
+      fetchImpl: gwFetch, connection: conn, tokenJson: TOKEN_JSON_STUB,
+    });
+    lines.push(`prepare ACCEPTED the real build shape: venue=${card.venue}, instructions=${card.intent.instructions.length} (must be 8)`);
+    const result = await sendCard({
+      keypair: kp, card, approve: card.fingerprint, dryRun: true,
+      connection: conn, fetchImpl: gwFetch, tokenJson: TOKEN_JSON_STUB,
+    });
+    ok = card.intent.instructions.length === 8
+      && result.mode === 'dry-run'
+      && result.deltas.solDelta === -10_005_000
+      && result.deltas.tokenDelta === '500'
+      && rawSends() === 0;
+    lines.push(
+      `dry-run deltas: solDelta=${result.deltas.solDelta} (must be -10005000: fee + trade input, WSOL ATA nets 0), tokenDelta=${result.deltas.tokenDelta} (must be 500)`,
+      `sendRawTransaction calls=${rawSends()} (must be 0)`,
+    );
+  } catch (e) {
+    lines.push(`threw ${e.code ?? ''}: ${e.message.slice(0, 220)}`);
+  }
+  report(23, 'real gateway build shape (WSOL wrap/unwrap) — prepare + dry-run pass with correct aggregate deltas', ok, lines);
+}
+
+// ---------------------------------------------------------------------------
+// Fixture 24 — same real shape, but the wrap leg sends the trade SOL
+// to a STRANGER's WSOL-lookalike ATA (derived for the stranger, not
+// the wallet). Create/sync/close still name the wallet's own ATA —
+// the transfer alone must refuse the whole build at prepare.
+// ---------------------------------------------------------------------------
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const stranger = Keypair.generate().publicKey;
+  const strangerWsolAta = associatedTokenAddress(new PublicKey(WSOL_MINT), stranger, TOKEN_PROGRAM_ID);
+  const { tx } = buildRealShapeTx({
+    kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh, wrapDestination: strangerWsolAta,
+  });
+  const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+  const ata = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const { preFor, postFor } = buyStateFns({ wallet, ata, pool: AGTR_POOL });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+  const gwFetch = makeGwFetch(stubBuild(txB64, blockhash, lvbh));
+  let ok = false; const lines = [];
+  try {
+    await prepareTrade({
+      wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own',
+      fetchImpl: gwFetch, connection: conn, tokenJson: TOKEN_JSON_STUB,
+    });
+    lines.push('prepareTrade DID NOT throw — the stranger wrap destination was accepted');
+  } catch (e) {
+    ok = (e.code === 'UNCLASSIFIED_INSTRUCTION' || e.code === 'UNEXPECTED_EFFECT') && rawSends() === 0;
+    lines.push(`prepare threw ${e.code ?? ''}: ${e.message.slice(0, 200)}…`);
+    lines.push(`sendRawTransaction calls=${rawSends()} (must be 0)`);
+  }
+  report(24, 'wrap leg to a stranger\u2019s WSOL-lookalike ATA — refused at prepare, 0 sends', ok, lines);
 }
 
 // ---------------------------------------------------------------------------
