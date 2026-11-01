@@ -497,6 +497,206 @@ export async function deriveIntent(input, connection) {
   }
 }
 
+// The transaction's account keys in MESSAGE ORDER (repair round 5,
+// P0-1): static keys first, then — for versioned transactions — each
+// lookup table's writable addresses followed by its readonly ones,
+// exactly the order the runtime resolves instruction account indices
+// against. The settlement attribution in runtime.mjs resolves the
+// simulation's inner-instruction account indices against this list,
+// so it must be derived with the same resolution rules as
+// deriveIntent (which sorts keys into sets and cannot be reused).
+export async function deriveOrderedAccountKeys(input, connection) {
+  const bytes = Buffer.isBuffer(input) ? input : Buffer.from(input, 'base64');
+  if (!serializedTxKind(bytes).versioned) {
+    const msg = Message.from(legacyMessageBytes(bytes));
+    return msg.accountKeys.map((k) => k.toBase58());
+  }
+  const vtx = VersionedTransaction.deserialize(bytes);
+  const keys = vtx.message.staticAccountKeys.map((k) => k.toBase58());
+  for (const lookup of vtx.message.addressTableLookups ?? []) {
+    if (!connection || typeof connection.getAddressLookupTable !== 'function') {
+      throw new IntentError(
+        'INTENT_ALT_UNRESOLVED',
+        `transaction uses address lookup table ${lookup.accountKey.toBase58()} but no connection was supplied to resolve it`,
+      );
+    }
+    const { value } = await connection.getAddressLookupTable(lookup.accountKey);
+    if (!value) {
+      throw new IntentError('INTENT_ALT_UNRESOLVED', `address lookup table ${lookup.accountKey.toBase58()} could not be fetched`);
+    }
+    const addresses = value.state.addresses;
+    for (const ai of lookup.writableIndexes) keys.push(addresses[ai].toBase58());
+    for (const ai of lookup.readonlyIndexes) keys.push(addresses[ai].toBase58());
+  }
+  return keys;
+}
+
+// ---------------------------------------------------------------------------
+// Pool-state vault derivation (repair round 5, TIGHTEN-1)
+//
+// The Meteora DBC pool account stores its own vaults: the 424-byte
+// pool state carries the base mint at byte offset 136, the base
+// vault at 168 and the quote vault at 200 (layout read from live
+// pool accounts, 2026-11-01). Both vaults are token accounts whose
+// authority is the venue-global pool-authority PDA (seeds
+// ['pool_authority'] under the DBC program — a constant, not a value
+// any build supplies). Deriving the vault set from the pool's own
+// state — and verifying each extracted vault reads back as a token
+// account for the right mint under that authority — pins the
+// counterparty settle's recipient INDEPENDENTLY of the transaction
+// being validated: the build cannot influence any step. Any read or
+// verification failure contributes NOTHING (fail-closed: the
+// recipient pin then refuses the settle at classification).
+// ---------------------------------------------------------------------------
+
+export function dbcPoolAuthorityPda() {
+  return pdaFor([Buffer.from('pool_authority')], PLATFORM_PROGRAMS.dbc);
+}
+
+const DBC_POOL_STATE_MIN_LENGTH = 232; // quote vault ends at offset 200 + 32
+const DBC_POOL_BASE_MINT_OFFSET = 136;
+const DBC_POOL_BASE_VAULT_OFFSET = 168;
+const DBC_POOL_QUOTE_VAULT_OFFSET = 200;
+
+function readTokenAccountFields(data) {
+  if (!data || data.length < 72) return null;
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  return {
+    mint: new PublicKey(buf.subarray(0, 32)).toBase58(),
+    owner: new PublicKey(buf.subarray(32, 64)).toBase58(),
+  };
+}
+
+export async function derivePoolStateVaults({ connection, tokenJson, mint }) {
+  const vaults = new Set();
+  if (!connection || typeof connection.getAccountInfo !== 'function') return vaults;
+  const authority = dbcPoolAuthorityPda();
+  for (const pool of canonicalPools(tokenJson)) {
+    try {
+      const info = await connection.getAccountInfo(new PublicKey(pool));
+      if (!info || !info.data) continue;
+      const ownerProgram = typeof info.owner === 'string' ? info.owner : info.owner?.toBase58?.();
+      if (ownerProgram !== PLATFORM_PROGRAMS.dbc) continue;
+      const data = Buffer.isBuffer(info.data) ? info.data : Buffer.from(info.data);
+      if (data.length < DBC_POOL_STATE_MIN_LENGTH) continue;
+      const baseMint = new PublicKey(data.subarray(DBC_POOL_BASE_MINT_OFFSET, DBC_POOL_BASE_MINT_OFFSET + 32)).toBase58();
+      if (baseMint !== mint) continue;
+      const candidates = [
+        { addr: new PublicKey(data.subarray(DBC_POOL_BASE_VAULT_OFFSET, DBC_POOL_BASE_VAULT_OFFSET + 32)).toBase58(), mint },
+        { addr: new PublicKey(data.subarray(DBC_POOL_QUOTE_VAULT_OFFSET, DBC_POOL_QUOTE_VAULT_OFFSET + 32)).toBase58(), mint: WSOL_MINT },
+      ];
+      for (const c of candidates) {
+        const vInfo = await connection.getAccountInfo(new PublicKey(c.addr));
+        if (!vInfo || !vInfo.data) continue;
+        const vOwner = typeof vInfo.owner === 'string' ? vInfo.owner : vInfo.owner?.toBase58?.();
+        if (vOwner !== TOKEN_PROGRAM && vOwner !== TOKEN_2022_PROGRAM) continue;
+        const fields = readTokenAccountFields(vInfo.data);
+        if (!fields || fields.mint !== c.mint || fields.owner !== authority) continue;
+        vaults.add(c.addr);
+      }
+    } catch {
+      // A pool whose state cannot be read or verified contributes
+      // nothing — the settle pin fails closed at classification.
+    }
+  }
+  return vaults;
+}
+
+// ---------------------------------------------------------------------------
+// Record-pinned pool vaults (repair round 5.1)
+//
+// The canonical record now PUBLISHES the pool's baseVault / quoteVault /
+// poolAuthority (the site generator sources them from the launch
+// records). When a record carries all three, they are the FIRST-CLASS
+// pin for the counterparty settle's recipient — but a published value
+// is a claim, so the pin is admitted only after cross-checking it
+// against the chain:
+//   * poolAuthority must equal the venue-global pool-authority PDA
+//     derived from the DBC program (a constant no record supplies);
+//   * each vault must read back as a token account for the right mint
+//     (base: the card mint; quote: wrapped SOL) whose authority is
+//     that PDA — the same read-back derivePoolStateVaults applies to
+//     state-extracted vaults;
+//   * wherever a canonical pool's state is legible (DBC-owned, full
+//     layout), the vaults it stores must EQUAL the record's.
+// A record that disagrees with the chain REFUSES — it never falls back
+// to derivation: a disagreeing record is a broken pinning source, and
+// the trade must not silently shop for a weaker pin. A record carrying
+// NONE of the three fields keeps the round-5 behavior (pool-state
+// derivation is the pin, or no pin). A record carrying only SOME of
+// them cannot be cross-checked completely and refuses.
+// ---------------------------------------------------------------------------
+
+export function canonicalRecordPoolFields(tokenJson) {
+  const a = tokenJson?.addresses ?? {};
+  const get = (k) => (typeof a[k] === 'string' && a[k] ? a[k] : null);
+  return { baseVault: get('baseVault'), quoteVault: get('quoteVault'), poolAuthority: get('poolAuthority') };
+}
+
+// Resolves the pool-vault pin for settle classification + send-time
+// effects: { vaults: Set<string>, source: 'record' | 'pool-state' |
+// null }. The vault set is exactly what round 5's derivation produced
+// — the pinning SOURCE is what changes; every downstream consumer
+// (classification, permitted set, measured per-recipient accounting,
+// attribution net-equality for swap-driven vaults) is untouched.
+export async function resolvePoolVaultPin({ connection, tokenJson, mint }) {
+  const rec = canonicalRecordPoolFields(tokenJson);
+  const present = [rec.baseVault, rec.quoteVault, rec.poolAuthority].filter(Boolean).length;
+  if (present === 0) {
+    const vaults = await derivePoolStateVaults({ connection, tokenJson, mint });
+    return { vaults, source: vaults.size ? 'pool-state' : null };
+  }
+  const mismatch = (why) => new IntentError(
+    'RECORD_POOL_VAULT_MISMATCH',
+    `the canonical record's published pool vaults cannot pin this trade: ${why}. Refusing — a record that disagrees with the chain is a broken pinning source, not a weaker pin.`,
+    { mint },
+  );
+  if (present !== 3) {
+    throw mismatch(`the record publishes only ${present} of baseVault/quoteVault/poolAuthority — a partial pin cannot be cross-checked`);
+  }
+  if (!connection || typeof connection.getAccountInfo !== 'function') {
+    throw mismatch('no connection is available to cross-check the published vaults against the chain');
+  }
+  const authority = dbcPoolAuthorityPda();
+  if (rec.poolAuthority !== authority) {
+    throw mismatch(`the record names poolAuthority ${rec.poolAuthority}, but the pool-authority PDA derived from the DBC program is ${authority}`);
+  }
+  for (const c of [
+    { addr: rec.baseVault, mint, label: 'baseVault' },
+    { addr: rec.quoteVault, mint: WSOL_MINT, label: 'quoteVault' },
+  ]) {
+    let info = null;
+    try { info = await connection.getAccountInfo(new PublicKey(c.addr)); } catch { info = null; }
+    const vOwner = typeof info?.owner === 'string' ? info.owner : info?.owner?.toBase58?.();
+    const fields = info?.data ? readTokenAccountFields(Buffer.isBuffer(info.data) ? info.data : Buffer.from(info.data)) : null;
+    if (!info || (vOwner !== TOKEN_PROGRAM && vOwner !== TOKEN_2022_PROGRAM) || !fields) {
+      throw mismatch(`the record's ${c.label} ${c.addr} does not read back as a token account`);
+    }
+    if (fields.mint !== c.mint || fields.owner !== authority) {
+      throw mismatch(`the record's ${c.label} ${c.addr} reads back as a token account for mint ${fields.mint} under authority ${fields.owner} — not the expected mint under the pool authority`);
+    }
+  }
+  // Pool-state agreement: wherever a canonical pool's state is
+  // legible, the vaults it stores must be exactly the record's.
+  for (const pool of canonicalPools(tokenJson)) {
+    let info = null;
+    try { info = await connection.getAccountInfo(new PublicKey(pool)); } catch { info = null; }
+    if (!info || !info.data) continue;
+    const ownerProgram = typeof info.owner === 'string' ? info.owner : info.owner?.toBase58?.();
+    if (ownerProgram !== PLATFORM_PROGRAMS.dbc) continue;
+    const data = Buffer.isBuffer(info.data) ? info.data : Buffer.from(info.data);
+    if (data.length < DBC_POOL_STATE_MIN_LENGTH) continue;
+    const baseMint = new PublicKey(data.subarray(DBC_POOL_BASE_MINT_OFFSET, DBC_POOL_BASE_MINT_OFFSET + 32)).toBase58();
+    if (baseMint !== mint) continue;
+    const stateBase = new PublicKey(data.subarray(DBC_POOL_BASE_VAULT_OFFSET, DBC_POOL_BASE_VAULT_OFFSET + 32)).toBase58();
+    const stateQuote = new PublicKey(data.subarray(DBC_POOL_QUOTE_VAULT_OFFSET, DBC_POOL_QUOTE_VAULT_OFFSET + 32)).toBase58();
+    if (stateBase !== rec.baseVault || stateQuote !== rec.quoteVault) {
+      throw mismatch(`pool ${pool}'s on-chain state names base/quote vaults ${stateBase} / ${stateQuote}, but the record publishes ${rec.baseVault} / ${rec.quoteVault}`);
+    }
+  }
+  return { vaults: new Set([rec.baseVault, rec.quoteVault]), source: 'record' };
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -586,12 +786,23 @@ function classifyPlatformInstruction(ix, ctx) {
     //   * a COUNTERPARTY settle (the crank the gateway bundles for
     //     the swap's other side) may pay that holder's derived token
     //     account, a canonical pool token vault (records that name
-    //     baseVault/tokenVault include it in the pool set), or the
-    //     account the transaction's own validated venue swap names
-    //     as its token vault — the curve pool's base vault is a
-    //     venue-program account the published record does not name,
-    //     and the swap that trades against it is validated
-    //     independently (discriminator + canonical pool).
+    //     baseVault/tokenVault include it in the pool set), or a
+    //     pool vault pinned INDEPENDENTLY of the build: since repair
+    //     round 5.1 the canonical record publishes the pool's
+    //     base/quote vaults, and resolvePoolVaultPin admits them
+    //     after cross-checking them against the on-chain vault and
+    //     pool-state reads (a disagreeing record refuses); for
+    //     records that name no vaults, the pin is still derived from
+    //     the pool's own on-chain state (derivePoolStateVaults).
+    //     Both sources land in ctx.poolStateVaults.
+    // Repair round 5 (TIGHTEN-1) removed the round-4 admission "or
+    // the account the transaction's own validated venue swap names":
+    // a recipient the BUILD chooses is not a pin — the swap naming
+    // an account says nothing about who owns it, so a build could
+    // settle a payout to any account its swap happened to name.
+    // Every admitted recipient is now pinned outside the build:
+    // derived from the holder, named by the canonical record, or
+    // derived from pool state read off the chain.
     // A settle paying any other account — above all a stranger's —
     // is not a production shape and refuses here, before modeling.
     {
@@ -605,8 +816,8 @@ function classifyPlatformInstruction(ix, ctx) {
         }
       } else if (a[2] !== holderAta
         && !sets.poolTokenAccounts.includes(a[2])
-        && !(ctx.venueAccounts && ctx.venueAccounts.has(a[2]))) {
-        shape('a counterparty settle pays an account that is neither the holder\u2019s derived token account, nor a canonical pool token vault, nor an account the venue swap names');
+        && !(ctx.poolStateVaults && ctx.poolStateVaults.has(a[2]))) {
+        shape('a counterparty settle pays an account that is neither the holder\u2019s derived token account, nor a canonical pool token vault, nor a vault derived from the canonical pool\u2019s on-chain state');
       }
     }
     if (a[3] !== mint) shape('settle does not name the card mint');
@@ -949,17 +1160,19 @@ export function validateIntent(intent, ctx) {
       { venue, mint },
     );
   }
-  // Accounts the transaction's venue swap(s) name — the counterparty
-  // settle's recipient pin (classifyPlatformInstruction) accepts the
-  // pool token vault the swap itself trades against.
-  const venueAccounts = new Set();
+  // Pool-state vaults derived INDEPENDENTLY of the build (repair
+  // round 5, TIGHTEN-1): the counterparty settle's recipient pin
+  // (classifyPlatformInstruction) accepts a pool token vault only
+  // when it was derived from the canonical pool's own on-chain state
+  // by the caller (derivePoolStateVaults) — never merely because the
+  // transaction's swap instruction names it. Rounds 1–4 admitted any
+  // account the swap named, which let the build itself choose its
+  // own settlement recipients. Callers that cannot derive the set
+  // pass nothing and the pin falls back to the derived holder ATAs
+  // and the record-named pool vaults only (fail-closed).
+  const poolStateVaults = ctx.poolStateVaults ?? new Set();
   for (const ix of intent.instructions) {
-    if (ix.programId === PLATFORM_PROGRAMS.dbc || ix.programId === PLATFORM_PROGRAMS.house) {
-      for (const a of ix.accounts) venueAccounts.add(a);
-    }
-  }
-  for (const ix of intent.instructions) {
-    classifyInstruction(ix, { wallet, mint, side: ctx.side, venueProgram, sets, venueAccounts });
+    classifyInstruction(ix, { wallet, mint, side: ctx.side, venueProgram, sets, poolStateVaults });
   }
 
   if (venue) {
