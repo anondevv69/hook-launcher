@@ -19,9 +19,9 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
-  chmodSync, copyFileSync, cpSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
+  chmodSync, copyFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 
@@ -49,6 +49,22 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 }
 
 const dist = process.env.AONLY_DIST || join(root, 'dist');
+// Output-path safety (repair round 4, P1-7a): the build begins by
+// RECURSIVELY DELETING its output directory. Rounds 1–3 took that
+// directory from $AONLY_DIST unchecked — an environment pointing at
+// an arbitrary absolute path would be wiped before any build ran.
+// The output must now resolve INSIDE the repository root (the
+// default dist/ or a subpath of the root); anything else refuses
+// before any deletion.
+{
+  const resolvedDist = resolve(dist);
+  const resolvedRoot = resolve(root);
+  if (resolvedDist !== resolvedRoot && !resolvedDist.startsWith(resolvedRoot + sep)) {
+    throw new Error(
+      `refusing to build: AONLY_DIST (${resolvedDist}) must resolve inside the repository root (${resolvedRoot}) — the build recursively deletes its output directory first, and an arbitrary path is never a safe deletion target`,
+    );
+  }
+}
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(dist, { recursive: true });
 
@@ -71,10 +87,33 @@ if (!version) throw new Error('runtime/package.json has no version');
 // staged entry is given its exact canonical mode (dirs 0755, files
 // 0644, the CLI entrypoint 0755), and the tar is built from staging.
 const RUNTIME_ENTRIES = ['bin', 'src', 'test', 'README.md', 'package.json', 'package-lock.json', '.gitignore'];
+// Tracked-file manifest (repair round 4, P1-3): the staged file set
+// is enumerated from `git ls-files` — the files Git tracks under
+// runtime/ — never by copying the working tree. Rounds 1–3 copied
+// directories recursively, so a git-IGNORED local file (a keypair, an
+// approval artifact — runtime/.gitignore names exactly those
+// patterns) sitting under runtime/src/ or runtime/test/ would have
+// been staged into the published tarball. The clean-tree gate does
+// not save that case: ignored files never appear in porcelain. Now
+// only tracked files can enter the stage, and every RUNTIME_ENTRIES
+// member must contribute at least one tracked file or the build
+// refuses (a renamed/missing input is a build error, not a smaller
+// tarball).
+const trackedRuntime = execFileSync('git', ['ls-files', '-z', '--', 'runtime'], { cwd: root })
+  .toString().split('\0').filter(Boolean)
+  .map((p) => p.slice('runtime/'.length))
+  .filter((rel) => RUNTIME_ENTRIES.some((e) => rel === e || rel.startsWith(e + '/')));
+for (const entry of RUNTIME_ENTRIES) {
+  if (!trackedRuntime.some((rel) => rel === entry || rel.startsWith(entry + '/'))) {
+    throw new Error(`tracked release set is missing runtime/${entry} — git ls-files names no file for it; refusing to build an incomplete tarball`);
+  }
+}
 const stage = join(dist, '.runtime-stage');
 mkdirSync(stage, { recursive: true });
-for (const entry of RUNTIME_ENTRIES) {
-  cpSync(join(root, 'runtime', entry), join(stage, entry), { recursive: true });
+for (const rel of trackedRuntime) {
+  const dest = join(stage, rel);
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(join(root, 'runtime', rel), dest);
 }
 const ENTRYPOINT = join(stage, 'bin', 'agentonly-runtime');
 const canonicalizeModes = (p) => {
