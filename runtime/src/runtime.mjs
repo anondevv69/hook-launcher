@@ -27,10 +27,13 @@ import {
   constants,
   existsSync,
   lstatSync,
+  mkdirSync,
   readFileSync,
   renameSync,
   writeFileSync,
 } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname as pathDirname, join as pathJoin } from 'node:path';
 import {
   Connection,
   Keypair,
@@ -42,6 +45,7 @@ import {
 import bs58 from 'bs58';
 import {
   ATA_PROGRAM,
+  PLATFORM_PROGRAMS,
   TOKEN_2022_PROGRAM,
   TOKEN_PROGRAM,
   WSOL_MINT,
@@ -68,6 +72,7 @@ export {
   engineConfigPda,
   engineMetaPda,
   enginePricePda,
+  housePoolPda,
   parseStrictDecimal,
   registrationPda,
   serializedTxKind,
@@ -279,6 +284,35 @@ export function writeWalletSidecar(file, sidecar) {
   try { chmodSync(p, 0o600); } catch { /* best effort on non-POSIX */ }
 }
 
+// Symlink-safe atomic file write (repair round 4, P1-7b) — the same
+// pattern as the sidecar write, generalized for the runtime's other
+// outputs (approval cards, the signer allowlist). The pre-round-4 CLI
+// wrote the approval card with a plain writeFileSync: a symlink
+// planted at the output path redirected the write onto whatever file
+// it pointed at, and an in-place write could tear. Here: a symlinked
+// target refuses outright; the bytes go to a fresh temp file in the
+// SAME directory (exclusive create, caller-chosen mode) and are
+// renamed over the target — atomic on POSIX, and the rename replaces
+// the directory entry itself rather than following it.
+export function writeFileAtomicSafe(path, contents, mode = 0o600) {
+  let stat = null;
+  try { stat = lstatSync(path); } catch { /* absent: the normal case */ }
+  if (stat?.isSymbolicLink()) {
+    throw new RuntimeError(
+      'WRITE_SYMLINK_REFUSED',
+      `refusing to write ${path} through a symlink — a planted link could redirect the write onto another file. Remove the link (or choose a different output path) and retry.`,
+      { path },
+    );
+  }
+  if (stat && !stat.isFile()) {
+    throw new RuntimeError('WRITE_TARGET_INVALID', `write target is not a regular file: ${path}`, { path });
+  }
+  const tmpPath = `${path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
+  writeFileSync(tmpPath, contents, { mode, flag: 'wx' });
+  renameSync(tmpPath, path);
+  try { chmodSync(path, mode); } catch { /* best effort on non-POSIX */ }
+}
+
 // The sidecar is integrity-bound to the wallet it describes (P1-g): it
 // records the wallet address AND the SHA-256 of the keypair file's
 // exact bytes. Attestation stamps the binding; every later load of a
@@ -461,9 +495,19 @@ export function fingerprintOf(transactionBase64) {
 // maxSolDebitLamports, feeCeilingLamports, blockhash. Altering any
 // policy field after approval changes the recomputed token, and the
 // send refuses (POLICY_BINDING_MISMATCH) before anything is signed.
+//
+// Repair round 4 (policy version 2) extends the bound serialization
+// with the remaining DISPLAYED economics the owner reads on the card
+// (P1-8: the quote's fee breakdown and the price impact — round 3
+// left them outside the token, so post-approval edits to what the
+// card DISPLAYS as fees/impact kept a valid approval) and with the
+// settlement-payout model (P1-1: the distributor vault, its payout
+// bound, and the exact recipient set). Version-1 tokens no longer
+// verify — deliberately: a card prepared under the weaker binding
+// must be re-prepared, never grandfathered.
 export function policyFingerprintOf(p) {
   return createHash('sha256').update(stableStringify({
-    policyVersion: 1,
+    policyVersion: 2,
     transactionFingerprint: p.transactionFingerprint,
     mint: p.mint,
     side: p.side,
@@ -474,7 +518,26 @@ export function policyFingerprintOf(p) {
     maxSolDebitLamports: String(p.maxSolDebitLamports),
     feeCeilingLamports: String(p.feeCeilingLamports),
     blockhash: p.blockhash,
+    fees: p.fees ?? null,
+    priceImpactBps: p.priceImpactBps ?? null,
+    settlementPayout: canonicalSettlementModel(p.settlementPayout),
   })).digest('hex');
+}
+
+// The settlement-payout model in its canonical, hashable shape: raw
+// amounts as strings, the recipient set sorted, absent model as null.
+// Both the prepare-time token and the send-time recompute pass through
+// here, so the two constructions cannot drift apart.
+export function canonicalSettlementModel(sp) {
+  if (!sp) return null;
+  return {
+    vault: sp.vault,
+    state: sp.state,
+    maxRaw: String(sp.maxRaw),
+    minRaw: String(sp.minRaw ?? '0'),
+    holderAtas: [...(sp.holderAtas ?? [])].sort(),
+    ownAta: sp.ownAta ?? null,
+  };
 }
 
 // The policy fingerprint recomputed from a card's own fields — the
@@ -492,6 +555,9 @@ export function cardPolicyFingerprint(card) {
     maxSolDebitLamports: v.maxSolDebitLamports,
     feeCeilingLamports: v.feeCeilingLamports,
     blockhash: card.blockhash,
+    fees: card.fees ?? null,
+    priceImpactBps: card.priceImpactBps ?? null,
+    settlementPayout: v.settlementPayout ?? null,
   });
 }
 
@@ -592,13 +658,69 @@ export async function prepareTrade(opts) {
     );
   }
 
+  // --- Venue binding (repair round 4, P1-4): the venue must be
+  //     present, known, and agreed by every source that names one —
+  //     the quote, the build, and the canonical record's route.
+  //     Rounds 1–3 resolved `build.venue ?? quote.venue`, so a build
+  //     silently overrode a disagreeing quote, an unknown string
+  //     mapped to no venue program (disabling the swap binding in
+  //     validateIntent), and the canonical route was never consulted
+  //     at prepare time at all.
+  const KNOWN_VENUES = ['curve', 'house'];
+  const quoteVenue = quote.venue ?? null;
+  const buildVenue = build.venue ?? null;
+  if (quoteVenue == null || buildVenue == null) {
+    throw new RuntimeError(
+      'VENUE_MISSING',
+      `the gateway ${quoteVenue == null ? 'quote' : 'build'} names no venue — the route cannot be bound. Refusing; no approval card was written.`,
+      { quoteVenue, buildVenue },
+    );
+  }
+  if (!KNOWN_VENUES.includes(quoteVenue) || !KNOWN_VENUES.includes(buildVenue)) {
+    throw new RuntimeError(
+      'VENUE_UNKNOWN',
+      `venue must be one of ${KNOWN_VENUES.join(', ')} — got quote '${quoteVenue}', build '${buildVenue}'. Refusing; no approval card was written.`,
+      { quoteVenue, buildVenue },
+    );
+  }
+  if (quoteVenue !== buildVenue) {
+    throw new RuntimeError(
+      'VENUE_MISMATCH',
+      `the gateway quote resolves to venue '${quoteVenue}' but its build was made for venue '${buildVenue}' — the two halves of the trade disagree about the route. Refusing; no approval card was written.`,
+      { quoteVenue, buildVenue },
+    );
+  }
+  const venue = buildVenue;
+  const routeVenue = token.routeHealth?.venue ?? null;
+  if (routeVenue != null && routeVenue !== venue) {
+    throw new RuntimeError(
+      'ROUTE_VENUE_MISMATCH',
+      `the canonical record's route for this token is venue '${routeVenue}' but the gateway built for '${venue}' — the build does not follow the token's canonical route. Refusing; no approval card was written.`,
+      { routeVenue, venue },
+    );
+  }
+
+  const amountInRaw = build.amount_in != null ? String(build.amount_in) : parsed.raw.toString();
+  if (build.amount_in != null && BigInt(build.amount_in) !== parsed.raw) {
+    throw new RuntimeError(
+      'INTENT_AMOUNT_MISMATCH',
+      `gateway build amount_in is ${build.amount_in} raw units but the request was ${parsed.raw} (${parsed.ui} UI units) — the build is not the trade that was asked for. Refusing; no approval card was written.`,
+    );
+  }
+  const minimumAmountOutRaw = build.minimum_amount_out != null ? String(build.minimum_amount_out) : String(quote.minimumAmountOut);
+  const expectedAmountOutRaw = build.amount_out_expected != null ? String(build.amount_out_expected) : String(quote.amountOut);
+  const fees = quote.fees ?? null;
+  const priceImpactBps = build.price_impact_bps ?? quote.priceImpactBps ?? null;
+
   // --- P0-1: decode + validate the intent before anything is carded ---
-  const venue = build.venue ?? quote.venue ?? null;
   let intent;
   let venueProgram = null;
   try {
     intent = await deriveIntent(build.transaction_base64, opts.connection);
-    ({ venueProgram } = validateIntent(intent, { wallet, mint, side, venue, tokenJson: token }));
+    ({ venueProgram } = validateIntent(intent, {
+      wallet, mint, side, venue, tokenJson: token,
+      amountInRaw, minimumAmountOutRaw,
+    }));
   } catch (e) {
     throw asRuntimeError(e);
   }
@@ -608,12 +730,84 @@ export async function prepareTrade(opts) {
       `gateway build claims blockhash ${build.blockhash} but the decoded transaction carries ${intent.recentBlockhash} — the build response contradicts its own bytes. Refusing; no approval card was written.`,
     );
   }
-  const amountInRaw = build.amount_in != null ? String(build.amount_in) : parsed.raw.toString();
-  if (build.amount_in != null && BigInt(build.amount_in) !== parsed.raw) {
-    throw new RuntimeError(
-      'INTENT_AMOUNT_MISMATCH',
-      `gateway build amount_in is ${build.amount_in} raw units but the request was ${parsed.raw} (${parsed.ui} UI units) — the build is not the trade that was asked for. Refusing; no approval card was written.`,
-    );
+
+  // --- Settlement-payout model (repair round 4, P1-1) ---
+  // A trade may bundle Distributor settles (the gateway bundles them
+  // for the wallet AND for the swap counterparty). A settle moves
+  // tokens OUT of the distributor vault into the settled holders'
+  // accounts, computed on-chain from each holder's entitlement
+  // (balance × distribution index − already-settled, per the
+  // distributor program) — the gateway build declares the bundle
+  // (`bundled: ["distributor-settle"]`) but no payout figure, and the
+  // entitlement depends on chain state at execution, so an exact
+  // payout cannot be known at prepare time. Round 3's exact sell
+  // debit therefore refused every settle-bundled sell (the payout
+  // lands in the same ATA as the swap leg), and the vault itself was
+  // outside the permitted-effects set. The model below is the
+  // bounded, visible alternative the round-3 review prescribed:
+  //   * authenticated bound: maxRaw is the distributor vault's token
+  //     balance, READ FROM THE CHAIN at prepare time against the
+  //     vault the canonical record names (mint/owner fields verified
+  //     against the record's distributor state — the same checks the
+  //     distributor program itself makes). No payout in this
+  //     transaction can exceed what the vault holds;
+  //   * visible: the model is a card field of its own (never netted
+  //     silently into the swap numbers), and bound into the approval
+  //     token (policy version 2);
+  //   * enforced at send: the vault's simulated outflow must be
+  //     ≤ maxRaw, every recipient must be exactly a settle-named
+  //     holder account from the validated intent, and the wallet's
+  //     OWN payout is decomposed out of its ATA delta and required
+  //     to lie in [minRaw, maxRaw] — the swap legs are then checked
+  //     NET of payouts, so a payout can never mask a bad swap.
+  //   minRaw is 0: the build states no payout minimum (verified
+  //   against live gateway builds — `bundled` carries labels only),
+  //   and a settle may legitimately pay exactly 0 (entitlement
+  //   already settled). The enforceable floor is therefore the
+  //   decomposition itself, not a positive minimum.
+  let settlementPayout = null;
+  const settleIxs = intent.instructions.filter(
+    (ix) => ix.programId === PLATFORM_PROGRAMS.distributor && ix.tag === 3,
+  );
+  if (settleIxs.length) {
+    const sets = tradeAccountSets({ wallet, mint, tokenJson: token });
+    const { distState, distVault } = sets.platform;
+    if (!distState || !distVault) {
+      throw new RuntimeError(
+        'SETTLEMENT_UNMODELED',
+        'the build bundles distributor settles but the canonical token record names no distributor state/vault to bound them against — refusing: an unauthenticated settlement cannot be modeled. No approval card was written.',
+        { mint },
+      );
+    }
+    if (!opts.connection || typeof opts.connection.getAccountInfo !== 'function') {
+      throw new RuntimeError(
+        'SETTLEMENT_VAULT_UNREADABLE',
+        'the build bundles distributor settles but no connection is available to read the distributor vault — the payout bound cannot be authenticated. Refusing; no approval card was written.',
+        { vault: distVault },
+      );
+    }
+    const vaultInfo = await opts.connection.getAccountInfo(new PublicKey(distVault));
+    const vaultParsed = vaultInfo?.data ? parseTokenAccountData(Buffer.from(vaultInfo.data)) : null;
+    if (!vaultParsed || vaultParsed.mint !== mint || vaultParsed.owner !== distState) {
+      throw new RuntimeError(
+        'SETTLEMENT_VAULT_UNREADABLE',
+        `the distributor vault ${distVault} named by the canonical record did not read back as a token account for this mint owned by the distributor state ${distState} — the payout bound cannot be authenticated. Refusing; no approval card was written.`,
+        { vault: distVault, state: distState },
+      );
+    }
+    const holderAtas = [...new Set(settleIxs.map((ix) => ix.accounts[2]))].sort();
+    const ownAta = settleIxs.some((ix) => ix.accounts[1] === wallet)
+      ? associatedTokenAddress(new PublicKey(mint), new PublicKey(wallet), TOKEN_2022_PROGRAM).toBase58()
+      : null;
+    settlementPayout = {
+      vault: distVault,
+      state: distState,
+      maxRaw: vaultParsed.amount.toString(),
+      minRaw: '0',
+      holderAtas,
+      ownAta,
+      settles: settleIxs.length,
+    };
   }
 
   const maxSolDebit = (side === 'buy' ? BigInt(amountInRaw) : 0n) + feeCeiling;
@@ -624,10 +818,11 @@ export async function prepareTrade(opts) {
     venueProgram,
     amountUi: parsed.ui,
     amountInRaw,
-    expectedAmountOutRaw: build.amount_out_expected != null ? String(build.amount_out_expected) : String(quote.amountOut),
-    minimumAmountOutRaw: build.minimum_amount_out != null ? String(build.minimum_amount_out) : String(quote.minimumAmountOut),
+    expectedAmountOutRaw,
+    minimumAmountOutRaw,
     feeCeilingLamports: feeCeiling.toString(),
     maxSolDebitLamports: maxSolDebit.toString(),
+    settlementPayout,
   };
 
   const fingerprint = fingerprintOf(build.transaction_base64);
@@ -642,6 +837,9 @@ export async function prepareTrade(opts) {
     maxSolDebitLamports: validation.maxSolDebitLamports,
     feeCeilingLamports: validation.feeCeilingLamports,
     blockhash: intent.recentBlockhash,
+    fees,
+    priceImpactBps,
+    settlementPayout,
   });
   const card = {
     version: 3,
@@ -658,8 +856,9 @@ export async function prepareTrade(opts) {
     amountIn: build.amount_in ?? quote.amountIn ?? null,
     expectedAmountOut: validation.expectedAmountOutRaw,
     minimumAmountOut: validation.minimumAmountOutRaw,
-    priceImpactBps: build.price_impact_bps ?? quote.priceImpactBps ?? null,
-    fees: quote.fees ?? null,
+    priceImpactBps,
+    fees,
+    settlementPayout,
     bundled: build.bundled ?? [],
     eligibility: { status: eligibility.status, reasons: eligibility.reasons ?? [] },
     simulation: {
@@ -695,6 +894,11 @@ export function formatCard(card) {
   if (card.bundled?.length) lines.push(`  bundled:   ${card.bundled.join(', ')} (prerequisites inside this one transaction)`);
   lines.push(`  simulated: ${card.simulation.status}${card.simulation.unitsConsumed ? ` (${card.simulation.unitsConsumed} compute units)` : ''} — provisional; the engine is the final arbiter on-chain`);
   lines.push(`  bounds:    max SOL debit ${card.maxSolDebitLamports} lamports (trade amount + fee ceiling ${card.feeCeilingLamports}); enforced against the signed-byte simulation at send time`);
+  if (card.settlementPayout) {
+    const sp = card.settlementPayout;
+    lines.push(`  settlement: this trade bundles ${sp.settles} distributor settle(s). Payouts are computed on-chain from holder entitlements and cannot be known exactly in advance; the approved bound is the distributor vault's balance at prepare time:`);
+    lines.push(`    vault ${sp.vault} — total payouts to the ${sp.holderAtas.length} settled holder account(s)${sp.ownAta ? ' (one of them yours)' : ''} must be \u2264 ${sp.maxRaw} raw units, paid only to the settle-named accounts, and the swap legs are checked NET of any payout to you. The bound is part of the approval token.`);
+  }
   if (card.intent) {
     lines.push('  validated intent summary (decoded from the transaction bytes at prepare time;');
     lines.push('  re-derived and compared byte-for-byte at send time — this is a summary, not the rules):');
@@ -758,9 +962,135 @@ function firstSignatureBytes(bytes) {
 }
 
 // ---------------------------------------------------------------------------
-// External signer adapter (P1-a; shell removed in repair round 2, P1-e)
+// External signer allowlist (repair round 4, P1-5)
 //
-// Protocol: the runtime spawns a TRUSTED EXECUTABLE directly (spawn
+// Rounds 1–3 validated the external signer's PATH SHAPE (a plain
+// executable path, no shell) — but the path itself came from the
+// agent-supplied --external-signer flag at send time, so anything
+// able to influence that flag could have the runtime execute an
+// arbitrary local binary with the transaction as its input. The
+// signer is now enrolled by the USER, ahead of time, into an
+// allowlist the send path merely consults:
+//
+//   agentonly-runtime signer enroll --path <executable>
+//
+// records the executable's ABSOLUTE path + the SHA-256 of its bytes
+// in a user-owned config file (default ~/.agentonly-runtime/
+// signers.json; AGENTONLY_SIGNER_ALLOWLIST overrides the location),
+// stored 0600 with the same load hardening as keypair/sidecar files
+// (symlink refused, group/world access refused, atomic symlink-safe
+// writes). A send refuses when: no allowlist exists
+// (SIGNER_ALLOWLIST_MISSING), the named executable is not enrolled
+// (SIGNER_NOT_ENROLLED), or the enrolled executable's bytes changed
+// since enrollment (SIGNER_INTEGRITY_MISMATCH — re-enroll after any
+// deliberate signer update). Enrollment binds the executable only;
+// --external-signer-arg values still flow to it, and its returned
+// bytes are still validated byte-for-byte (validateExternalSigned).
+// ---------------------------------------------------------------------------
+
+export function signerAllowlistPath() {
+  return process.env.AGENTONLY_SIGNER_ALLOWLIST
+    ?? pathJoin(homedir(), '.agentonly-runtime', 'signers.json');
+}
+
+export function readSignerAllowlist() {
+  const p = signerAllowlistPath();
+  let stat;
+  try {
+    stat = lstatSync(p);
+  } catch {
+    return null; // no allowlist yet
+  }
+  if (stat.isSymbolicLink()) {
+    throw new RuntimeError(
+      'SIGNER_ALLOWLIST_SYMLINK',
+      `refusing to trust a signer allowlist reached through a symlink: ${p} — pass the real path instead`,
+    );
+  }
+  if (!stat.isFile()) {
+    throw new RuntimeError('SIGNER_ALLOWLIST_INVALID', `signer allowlist path is not a regular file: ${p}`);
+  }
+  if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
+    throw new RuntimeError(
+      'SIGNER_ALLOWLIST_PERMISSIONS',
+      `refusing to trust signer allowlist ${p}: it is accessible by group/others (mode ${(stat.mode & 0o777).toString(8)}). The allowlist decides which binaries may sign — it must be owner-only. Fix it with: chmod 600 ${p}`,
+    );
+  }
+  let doc;
+  try {
+    doc = JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    throw new RuntimeError('SIGNER_ALLOWLIST_INVALID', `signer allowlist is not readable JSON: ${p} — refusing to guess at its contents`);
+  }
+  if (!doc || !Array.isArray(doc.signers)) {
+    throw new RuntimeError('SIGNER_ALLOWLIST_INVALID', `signer allowlist ${p} has no signers array — refusing to guess at its contents`);
+  }
+  return doc;
+}
+
+export function enrollSigner(executable) {
+  assertValidExternalSigner(executable);
+  if (!executable.startsWith('/')) {
+    throw new RuntimeError(
+      'EXTERNAL_SIGNER_INVALID',
+      `enrollment requires an absolute executable path (got '${executable}') — the allowlist binds the exact absolute path the send will name`,
+      { executable },
+    );
+  }
+  const sha256 = createHash('sha256').update(readFileSync(executable)).digest('hex');
+  const p = signerAllowlistPath();
+  mkdirSync(pathDirname(p), { recursive: true, mode: 0o700 });
+  const doc = readSignerAllowlist() ?? { version: 1, signers: [] };
+  const entry = { path: executable, sha256, enrolledAt: new Date().toISOString() };
+  const idx = doc.signers.findIndex((s) => s.path === executable);
+  if (idx >= 0) doc.signers[idx] = entry;
+  else doc.signers.push(entry);
+  writeFileAtomicSafe(p, JSON.stringify(doc, null, 2) + '\n', 0o600);
+  return { ...entry, allowlistPath: p };
+}
+
+export function assertSignerEnrolled(executable) {
+  const doc = readSignerAllowlist();
+  if (!doc) {
+    throw new RuntimeError(
+      'SIGNER_ALLOWLIST_MISSING',
+      `refusing to run an external signer: no signer allowlist exists at ${signerAllowlistPath()}. An external signer must be enrolled by the user before any send can use it: agentonly-runtime signer enroll --path ${executable}`,
+      { executable },
+    );
+  }
+  const entry = doc.signers.find((s) => s.path === executable);
+  if (!entry) {
+    throw new RuntimeError(
+      'SIGNER_NOT_ENROLLED',
+      `refusing to run external signer ${executable}: it is not enrolled in the signer allowlist (${signerAllowlistPath()}). Enrollment is the user's act, done ahead of time: agentonly-runtime signer enroll --path ${executable}`,
+      { executable },
+    );
+  }
+  let current;
+  try {
+    current = createHash('sha256').update(readFileSync(executable)).digest('hex');
+  } catch (e) {
+    throw new RuntimeError(
+      'SIGNER_INTEGRITY_MISMATCH',
+      `refusing to run external signer ${executable}: its bytes could not be read for the enrollment integrity check (${e.message})`,
+      { executable },
+    );
+  }
+  if (current !== entry.sha256) {
+    throw new RuntimeError(
+      'SIGNER_INTEGRITY_MISMATCH',
+      `refusing to run external signer ${executable}: its bytes changed since enrollment (enrolled sha256 ${entry.sha256.slice(0, 12)}…, current ${current.slice(0, 12)}…). If the change is deliberate, re-enroll: agentonly-runtime signer enroll --path ${executable}`,
+      { executable },
+    );
+  }
+  return entry;
+}
+
+// ---------------------------------------------------------------------------
+// External signer adapter (P1-a; shell removed in repair round 2, P1-e;
+// enrollment required in repair round 4, P1-5)
+//
+// Protocol: the runtime spawns an ENROLLED EXECUTABLE directly (spawn
 // with shell: false — never a shell, so signer text can never become
 // shell syntax), passes structured arguments from repeatable
 // --external-signer-arg flags, writes the UNSIGNED transaction
@@ -821,6 +1151,10 @@ function defaultRunSigner(executable, args, inputBase64) {
 export async function runExternalSigner(executable, unsignedBase64, opts = {}) {
   const args = opts.args ?? [];
   assertValidExternalSigner(executable);
+  // Repair round 4, P1-5: path shape is not trust. The executable
+  // must be enrolled (path + SHA-256 of its bytes) in the user's
+  // signer allowlist, and its bytes must still match the enrollment.
+  assertSignerEnrolled(executable);
   if (!Array.isArray(args) || args.some((a) => typeof a !== 'string')) {
     throw new RuntimeError('EXTERNAL_SIGNER_INVALID', 'external signer arguments must be strings (repeatable --external-signer-arg)');
   }
@@ -1093,7 +1427,7 @@ export function assertSimulationStatesComplete(preStates, postStates, addresses,
 // trade's counterparty (it cannot gain tokens on a buy, cannot pay out
 // more SOL than the approved input, etc.). The wallet's own aggregate
 // bounds are enforced separately by enforceEconomicBounds.
-export function enforceFullEffects(card, effects, sets) {
+export function enforceFullEffects(card, effects, sets, settlement = null) {
   const unexpected = (addr, what) => {
     throw new RuntimeError(
       'UNEXPECTED_EFFECT',
@@ -1101,6 +1435,7 @@ export function enforceFullEffects(card, effects, sets) {
       { account: addr },
     );
   };
+  const sp = card.validation?.settlementPayout ?? null;
   for (const [addr, eff] of effects) {
     // The wallet's WSOL ATA may move its wrapped-SOL balance — that
     // value is accounted in lamports against the wallet's aggregate.
@@ -1118,7 +1453,12 @@ export function enforceFullEffects(card, effects, sets) {
     if (card.side === 'buy' && eff.tokenDelta < 0n) {
       unexpected(ata, 'the wallet\u2019s own token account is DEBITED on a buy');
     }
-    if (card.side === 'sell' && eff.tokenDelta > 0n) {
+    // Repair round 4, P1-1: on a sell WITH a modeled settlement, the
+    // wallet's own settlement account may be net-credited (its payout
+    // can exceed the sold amount) — that credit is the modeled payout,
+    // decomposed and bounded in enforceEconomicBounds. The blanket
+    // no-credit rule still applies to every other wallet account.
+    if (card.side === 'sell' && eff.tokenDelta > 0n && !(sp && ata === sp.ownAta)) {
       unexpected(ata, 'the wallet\u2019s own token account is CREDITED on a sell');
     }
     if (eff.lamportDelta < 0) {
@@ -1141,6 +1481,77 @@ export function enforceFullEffects(card, effects, sets) {
       if (eff.tokenDelta < 0n) unexpected(addr, 'a pool account LOSES the card token on a sell — value disappearing to nowhere');
     }
   }
+
+  // Settlement effects (repair round 4, P1-1). The distributor vault
+  // and the settle-named recipient accounts were added to the
+  // permitted set by sendCard (from the card's policy-bound model);
+  // here their movements are held to the model exactly:
+  //   * the vault may only LOSE tokens (payouts flow out; a trade
+  //     transaction never routes fees INTO the distributor vault —
+  //     funding happens through distribute(), a different
+  //     instruction that is not part of a trade), its lamports never
+  //     move, and the total outflow is ≤ the card's maxRaw (the
+  //     vault balance authenticated at prepare time);
+  //   * every non-pool recipient account gains between 0 and maxRaw
+  //     (recipients that are also pool vaults are covered by the pool
+  //     rules above plus the aggregate outflow bound);
+  //   * the measured total outflow must equal the vault's token
+  //     delta the caller decomposed — a caller that cannot measure
+  //     it has no business approving the send.
+  if (sp) {
+    if (!settlement || typeof settlement.totalPayoutRaw !== 'bigint') {
+      throw new RuntimeError(
+        'SETTLEMENT_EFFECT_UNMEASURED',
+        'refusing to broadcast: this card models a settlement payout but the send did not measure the vault\u2019s simulated outflow — the payout bound cannot be enforced. Discard the card and prepare again.',
+      );
+    }
+    const maxRaw = BigInt(sp.maxRaw);
+    const vaultEff = effects.get(sp.vault);
+    if (!vaultEff) {
+      throw new RuntimeError(
+        'SETTLEMENT_EFFECT_UNMEASURED',
+        `refusing to broadcast: the distributor vault ${sp.vault} has no simulated account state — the payout bound cannot be enforced.`,
+      );
+    }
+    if (vaultEff.tokenDelta > 0n) {
+      unexpected(sp.vault, 'the distributor vault GAINS tokens during the trade — settlement payouts only flow out of it');
+    }
+    if (-vaultEff.tokenDelta !== settlement.totalPayoutRaw) {
+      throw new RuntimeError(
+        'SETTLEMENT_EFFECT_UNMEASURED',
+        'refusing to broadcast: the measured settlement outflow does not match the distributor vault\u2019s simulated token delta — internal accounting disagreement; the payout bound cannot be enforced.',
+      );
+    }
+    if (settlement.totalPayoutRaw > maxRaw) {
+      throw new RuntimeError(
+        'SETTLEMENT_PAYOUT_EXCEEDS_MAX',
+        `refusing to broadcast: the signed-byte simulation pays out ${settlement.totalPayoutRaw} raw units from the distributor vault, beyond the card's approved settlement bound of ${maxRaw} (the vault balance authenticated at prepare time). The approval does not cover this payout. Discard the card and prepare again.`,
+        { totalPayoutRaw: settlement.totalPayoutRaw.toString(), maxRaw: sp.maxRaw },
+      );
+    }
+    if (vaultEff.lamportDelta !== 0) {
+      unexpected(sp.vault, 'the distributor vault\u2019s lamports change — only its token balance may move, and only outward');
+    }
+    for (const holderAta of sp.holderAtas) {
+      if (holderAta === sp.ownAta) continue; // the wallet's own: decomposed in enforceEconomicBounds
+      if (sets.poolAccounts.includes(holderAta)) continue; // pool vaults: pool rules + aggregate bound
+      // An account the venue swap itself names (the curve pool's
+      // base vault — a settlement recipient in its counterparty
+      // form) is swap-driven: its delta mixes the swap leg with the
+      // payout, and the payout component is bounded by the aggregate
+      // outflow bound above. The per-recipient bound below is for
+      // accounts whose ONLY role in the trade is receiving a payout.
+      if (settlement.venueAccounts?.has(holderAta)) continue;
+      const eff = effects.get(holderAta);
+      if (!eff) continue;
+      if (eff.tokenDelta < 0n || eff.tokenDelta > maxRaw) {
+        unexpected(holderAta, `a settlement recipient\u2019s token balance changes by ${eff.tokenDelta} — outside the modeled payout bound [0, ${maxRaw}]`);
+      }
+      if (eff.lamportDelta < 0) {
+        unexpected(holderAta, 'a settlement recipient pays lamports out');
+      }
+    }
+  }
 }
 
 export function enforceEconomicBounds(card, deltas) {
@@ -1156,6 +1567,7 @@ export function enforceEconomicBounds(card, deltas) {
     );
   }
   const minOut = BigInt(card.validation.minimumAmountOutRaw);
+  const sp = card.validation.settlementPayout ?? null;
   if (card.side === 'buy') {
     if (tokenDelta < minOut) {
       throw new RuntimeError(
@@ -1164,6 +1576,36 @@ export function enforceEconomicBounds(card, deltas) {
           `minimum out of ${minOut}. Refusing — the build does less than the card approved.`,
         { tokenDelta: tokenDelta.toString() },
       );
+    }
+    // Repair round 4, P1-1: on a settle-bundled buy, the wallet's ATA
+    // credit mixes the swap's output with its settlement payout — a
+    // payout drawn from the distributor vault (other holders' accrued
+    // fees) must not be allowed to MASK a swap that pays less than
+    // the approved minimum. The swap leg is therefore checked NET of
+    // the transaction's total settlement payouts (measured from the
+    // vault's outflow): the most payout the wallet itself could have
+    // received is the total, so netting the total is the conservative
+    // direction — the guarantee is that the SWAP alone met the
+    // minimum. (Documented edge: if the counterparty's own payout is
+    // large and the swap output sits within that payout of the
+    // minimum, the send refuses although the trade itself was
+    // legitimate — fail-closed by design; re-preparing does not
+    // change chain state, so the refusal names the cause.)
+    if (sp) {
+      const totalPayout = deltas.settlement?.totalPayoutRaw;
+      if (typeof totalPayout !== 'bigint') {
+        throw new RuntimeError(
+          'SETTLEMENT_EFFECT_UNMEASURED',
+          'refusing to broadcast: this card models a settlement payout but the send did not measure the vault\u2019s simulated outflow — the swap leg cannot be checked net of payouts.',
+        );
+      }
+      if (tokenDelta - totalPayout < minOut) {
+        throw new RuntimeError(
+          'ECONOMIC_BOUND_EXCEEDED',
+          `the signed-byte simulation credits ${tokenDelta} raw units of the token, of which up to ${totalPayout} are distributor settlement payouts — net of payouts the swap leg credits only ${tokenDelta - totalPayout}, below the card's minimum out of ${minOut}. Refusing — a settlement payout may not mask a swap that under-delivers.`,
+          { tokenDelta: tokenDelta.toString(), totalPayoutRaw: totalPayout.toString() },
+        );
+      }
     }
   } else {
     const amountRaw = BigInt(card.validation.amountInRaw);
@@ -1174,13 +1616,30 @@ export function enforceEconomicBounds(card, deltas) {
     // simulated wallet token delta must equal -amountInRaw exactly;
     // both directions refuse. No tolerance is granted: a build whose
     // net wallet token movement is anything other than the approved
-    // sell amount is not the trade the owner approved. (This also
-    // refuses, fail-closed as before, a sell whose bundled distributor
-    // settle pays out into the same ATA inside the same transaction —
-    // the net delta then differs from the swap leg alone. That is the
-    // pre-existing under-debit behavior, kept deliberately rather than
-    // papered over with an allowance.)
-    if (tokenDelta !== -amountRaw) {
+    // sell amount is not the trade the owner approved.
+    //
+    // Repair round 4, P1-1: when the card models a settlement payout,
+    // exactness applies to the SWAP LEG, with the payout decomposed
+    // out — never netted silently. The wallet's ATA has exactly two
+    // flows on a sell (the swap debit and its own settle payout), so
+    // the decomposition is exact arithmetic: ownPayout = tokenDelta
+    // + amountInRaw. It must lie inside the card's modeled bound
+    // [minRaw, maxRaw]; the remainder of this check then sees the
+    // pure swap leg. A card WITHOUT a settlement model keeps the
+    // round-3 rule untouched — any bundled payout on an unmodeled
+    // card still refuses, fail-closed.
+    if (sp) {
+      const ownPayout = tokenDelta + amountRaw;
+      const maxRaw = BigInt(sp.maxRaw);
+      const minRaw = BigInt(sp.minRaw ?? '0');
+      if (ownPayout < minRaw || ownPayout > maxRaw) {
+        throw new RuntimeError(
+          'ECONOMIC_BOUND_EXCEEDED',
+          `the signed-byte simulation decomposes the wallet's token delta (${tokenDelta}) into the approved sell debit (${amountRaw}) plus a settlement payout of ${ownPayout} — outside the card's modeled settlement bound [${minRaw}, ${maxRaw}]. Refusing — the payout is not the one the card approved.`,
+          { tokenDelta: tokenDelta.toString(), ownPayoutRaw: ownPayout.toString() },
+        );
+      }
+    } else if (tokenDelta !== -amountRaw) {
       throw new RuntimeError(
         'ECONOMIC_BOUND_EXCEEDED',
         tokenDelta < -amountRaw
@@ -1277,13 +1736,18 @@ export async function sendCard(opts) {
 
   // 5. Route check: if the venue moved since preparation (e.g. the token
   //    graduated), the prepared route is stale and must be rebuilt.
+  //    Repair round 4, P1-4: the check is strict in both directions —
+  //    a fresh quote that names NO venue, or a venue the runtime does
+  //    not know, refuses just as a changed venue does. (A card that
+  //    itself names no venue still falls through to step 5b's
+  //    CANONICAL_BINDING_MISSING, which is the more precise refusal.)
   if (!opts.skipVenueCheck) {
     const venueNow = await freshQuoteVenue(fetchImpl, card);
-    if (venueNow && card.venue && venueNow !== card.venue) {
+    if (card.venue && venueNow !== card.venue) {
       throw new RuntimeError(
         'VENUE_CHANGED',
         `refusing to sign: the route changed since this card was prepared — the token ` +
-          `now resolves to venue '${venueNow}', but the card was built for '${card.venue}' ` +
+          `now resolves to venue '${venueNow ?? '(none named)'}', but the card was built for '${card.venue}' ` +
           `(this is what graduation does). Discard the card, run prepare again against ` +
           `the new route, and approve the fresh card.`,
         { cardVenue: card.venue, currentVenue: venueNow },
@@ -1305,6 +1769,18 @@ export async function sendCard(opts) {
     );
   }
   const tokenJson = opts.tokenJson ?? (await fetchTokenRecord(fetchImpl, card.mint));
+  // Canonical route agreement (repair round 4, P1-4): when the
+  // canonical record names the token's route, the card's venue must
+  // equal it — the same agreement prepare now requires, re-checked
+  // at send time against the freshly fetched record.
+  const routeVenue = tokenJson?.routeHealth?.venue ?? null;
+  if (routeVenue != null && routeVenue !== card.venue) {
+    throw new RuntimeError(
+      'ROUTE_VENUE_MISMATCH',
+      `refusing to sign: the canonical record's route for this token is venue '${routeVenue}', but this card was built for '${card.venue}'. Discard the card and prepare again against the canonical route.`,
+      { cardVenue: card.venue, routeVenue },
+    );
+  }
 
   // 6. Intent: re-derive from the card's bytes and deep-compare with the
   //    intent stored at prepare time; re-validate against the card's own
@@ -1331,9 +1807,33 @@ export async function sendCard(opts) {
       side: card.side,
       venue: card.venue ?? null,
       tokenJson,
+      amountInRaw: card.validation?.amountInRaw,
+      minimumAmountOutRaw: card.validation?.minimumAmountOutRaw,
     });
   } catch (e) {
     throw asRuntimeError(e);
+  }
+  // Settlement model agreement (repair round 4, P1-1): the settles in
+  // the re-derived intent must be exactly the set the card's
+  // policy-bound model covers — same recipients, derived from the
+  // card's own bytes. A model naming recipients the transaction does
+  // not settle (or a transaction settling recipients the model does
+  // not name) means the approval and the bytes describe different
+  // payouts.
+  {
+    const model = card.validation.settlementPayout ?? null;
+    const settleIxs = derived.instructions.filter(
+      (ix) => ix.programId === PLATFORM_PROGRAMS.distributor && ix.tag === 3,
+    );
+    const actualHolders = [...new Set(settleIxs.map((ix) => ix.accounts[2]))].sort();
+    const modeledHolders = model ? [...model.holderAtas].sort() : [];
+    if (stableStringify(actualHolders) !== stableStringify(modeledHolders)) {
+      throw new RuntimeError(
+        'SETTLEMENT_MODEL_MISMATCH',
+        `refusing to sign: the transaction settles payouts to [${actualHolders.join(', ') || 'none'}] but the card's settlement model covers [${modeledHolders.join(', ') || 'none'}] — the approval and the bytes describe different payouts. Discard the card and prepare again.`,
+        { actualHolders, modeledHolders },
+      );
+    }
   }
   const v = card.validation;
   const friendlyMismatch =
@@ -1345,11 +1845,13 @@ export async function sendCard(opts) {
     || v.expectedAmountOutRaw !== (card.expectedAmountOut != null ? String(card.expectedAmountOut) : null)
     || v.maxSolDebitLamports !== (card.maxSolDebitLamports ?? null)
     || v.feeCeilingLamports !== (card.feeCeilingLamports ?? null)
+    || stableStringify(canonicalSettlementModel(v.settlementPayout ?? null))
+      !== stableStringify(canonicalSettlementModel(card.settlementPayout ?? null))
     || card.blockhash !== derived.recentBlockhash;
   if (friendlyMismatch) {
     throw new RuntimeError(
       'INTENT_CARD_MISMATCH',
-      'refusing to sign: the card\u2019s displayed fields (amount, minimum out, bounds, blockhash) do not match its validated intent record — the card was altered after preparation. Discard it and prepare again.',
+      'refusing to sign: the card\u2019s displayed fields (amount, minimum out, bounds, settlement model, blockhash) do not match its validated intent record — the card was altered after preparation. Discard it and prepare again.',
     );
   }
   // Policy binding (repair round 3, P0-1): the friendly cross-check
@@ -1363,7 +1865,7 @@ export async function sendCard(opts) {
   if (cardPolicyFingerprint(card) !== card.approvalToken) {
     throw new RuntimeError(
       'POLICY_BINDING_MISMATCH',
-      'refusing to sign: the card\u2019s economic policy does not hash to its approval token — a policy field (mint, side, venue, amount, minimum out, expected out, max debit, fee ceiling, blockhash) was altered after approval, whether or not the displayed fields were edited to match. The approval no longer covers this policy. Discard the card and prepare again.',
+      'refusing to sign: the card\u2019s economic policy does not hash to its approval token — a policy field (mint, side, venue, amount, minimum out, expected out, max debit, fee ceiling, blockhash, displayed fees, price impact, settlement model) was altered after approval, whether or not the displayed fields were edited to match. The approval no longer covers this policy. Discard the card and prepare again.',
     );
   }
 
@@ -1399,6 +1901,23 @@ export async function sendCard(opts) {
   //    simulation state refuses (P0-2) — there is no pass-through. Any
   //    failure here means sendRawTransaction is never reached.
   const sets = tradeAccountSets({ wallet: signerAddress, mint: card.mint, tokenJson });
+  // Settlement accounts (repair round 4, P1-1): when the card models
+  // a settlement payout, the distributor vault + state, the
+  // settle-named recipient accounts, and the settles' claim PDAs join
+  // the permitted-effects set. Their movements are then held to the
+  // model in enforceFullEffects — permitted to move ONLY as the
+  // modeled payout allows, never freely.
+  const settlementModel = card.validation.settlementPayout ?? null;
+  if (settlementModel) {
+    sets.permitted.add(settlementModel.vault);
+    sets.permitted.add(settlementModel.state);
+    for (const h of settlementModel.holderAtas) sets.permitted.add(h);
+    for (const ix of derived.instructions) {
+      if (ix.programId === PLATFORM_PROGRAMS.distributor && ix.tag === 3) {
+        sets.permitted.add(ix.accounts[6]); // the settle's claim PDA
+      }
+    }
+  }
   const addresses = [...new Set([
     ...(card.intent?.writableAccounts ?? []),
     signerAddress,
@@ -1447,10 +1966,28 @@ export async function sendCard(opts) {
       return acc + (e && e.tokenMint === card.mint ? e.tokenDelta : 0n);
     }, 0n),
   };
+  // The settlement outflow, measured from the distributor vault's
+  // simulated token delta (repair round 4, P1-1): the single number
+  // both enforcement passes hold the payouts to. The venue swap's
+  // account set rides along so the per-recipient bound can tell a
+  // pure payout recipient from a swap vault (see enforceFullEffects).
+  if (settlementModel) {
+    const vaultEff = effects.get(settlementModel.vault);
+    const venueAccounts = new Set();
+    for (const ix of derived.instructions) {
+      if (ix.programId === PLATFORM_PROGRAMS.dbc || ix.programId === PLATFORM_PROGRAMS.house) {
+        for (const a of ix.accounts) venueAccounts.add(a);
+      }
+    }
+    deltas.settlement = { totalPayoutRaw: vaultEff ? -vaultEff.tokenDelta : 0n, venueAccounts };
+  }
   enforceEconomicBounds(card, deltas);
-  enforceFullEffects(card, effects, sets);
+  enforceFullEffects(card, effects, sets, deltas.settlement ?? null);
   const economicBounds = 'enforced';
   const deltasOut = { solDelta: deltas.solDelta, tokenDelta: deltas.tokenDelta.toString() };
+  if (deltas.settlement) {
+    deltasOut.settlementPayoutRaw = deltas.settlement.totalPayoutRaw.toString();
+  }
 
   if (opts.dryRun) {
     return {
@@ -1481,8 +2018,31 @@ export async function sendCard(opts) {
   // the result entirely — a failed trade could be reported as a
   // successful receipt. The confirmation error is checked explicitly;
   // an errored confirmation is a failure, never a receipt.
-  const confirmationError = confirmation?.value?.err ?? null;
-  if (confirmationError) {
+  //
+  // Repair round 4, P1-6: the round-3 check read the error with
+  // `confirmation?.value?.err ?? null`, so a MALFORMED confirmation —
+  // `{}`, a missing value, a value without an err field — collapsed
+  // to null and was reported as success. Success now requires the
+  // well-formed shape strictly: a confirmation object whose value is
+  // an object carrying an `err` field that is exactly null. Anything
+  // else is a failure to verify the outcome — reported as a failure,
+  // never as a receipt (the transaction may or may not have landed;
+  // the signature is named so the owner can check it).
+  const confirmationValue = confirmation?.value;
+  const confirmationWellFormed = !!confirmation
+    && typeof confirmation === 'object'
+    && !!confirmationValue
+    && typeof confirmationValue === 'object'
+    && 'err' in confirmationValue;
+  if (!confirmationWellFormed) {
+    throw new RuntimeError(
+      'CONFIRMATION_UNVERIFIED',
+      `transaction ${sig} was broadcast but its confirmation response was malformed (${JSON.stringify(confirmation)?.slice(0, 120) ?? 'no response'}) — the outcome cannot be verified, so it is reported as a failure, not a receipt. Check the signature on a block explorer before doing anything else; do not re-send blindly.`,
+      { signature: sig },
+    );
+  }
+  const confirmationError = confirmationValue.err;
+  if (confirmationError !== null) {
     throw new RuntimeError(
       'TRANSACTION_FAILED_ONCHAIN',
       `transaction ${sig} was confirmed but FAILED on-chain: ${JSON.stringify(confirmationError)}. ` +
