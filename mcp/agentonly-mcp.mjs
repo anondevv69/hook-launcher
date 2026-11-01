@@ -124,8 +124,29 @@ async function toolVerify({ signature }) {
     body: { jsonrpc: '2.0', id: 1, method: 'getSignatureStatuses', params: [[signature], { searchTransactionHistory: true }] },
   });
   const st = statuses?.result?.value?.[0] || null;
-  if (!st) return ok(`verify: signature ${signature} not found on-chain yet (no status).`, { signature, found: false });
-  let summary = `verify: ${signature} — confirmation=${st.confirmationStatus || 'processed'}, slot=${st.slot}, ${st.err ? `FAILED: ${JSON.stringify(st.err)}` : 'succeeded (no error)'}`;
+  if (!st) return ok(`verify: signature ${signature} NOT VERIFIED — not found on-chain yet (no status).`, { signature, found: false, verified: false });
+  // Verification strictness (repair round 5, item 4): a transaction
+  // counts as verified ONLY when its status entry is well-formed —
+  // an object carrying an err field — with err exactly null AND a
+  // confirmation status of confirmed or finalized. Rounds 1–4
+  // reported any status with no error as "succeeded", including a
+  // merely processed (unconfirmed, still reversible) one, and a
+  // malformed entry collapsed to the same answer. A processed-only
+  // status, a missing confirmation status, a non-null error, or a
+  // malformed entry is NOT verified, and says so plainly.
+  const wellFormed = typeof st === 'object' && 'err' in st && typeof st.confirmationStatus === 'string';
+  const verified = wellFormed && st.err === null
+    && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized');
+  let summary;
+  if (!wellFormed) {
+    summary = `verify: ${signature} — NOT VERIFIED: the status entry is malformed (missing its err field or confirmation status), so the outcome cannot be established. slot=${st.slot ?? '?'}`;
+  } else if (st.err !== null) {
+    summary = `verify: ${signature} — NOT VERIFIED: the transaction FAILED on-chain: ${JSON.stringify(st.err)} (confirmation=${st.confirmationStatus}, slot=${st.slot})`;
+  } else if (!verified) {
+    summary = `verify: ${signature} — NOT VERIFIED: confirmation=${st.confirmationStatus} is not yet confirmed/finalized (slot=${st.slot}); a processed-only status can still roll back.`;
+  } else {
+    summary = `verify: ${signature} — VERIFIED: confirmation=${st.confirmationStatus}, slot=${st.slot}, err=null`;
+  }
   let tx = null;
   try {
     const txRes = await fetchJson(RPC, {
@@ -135,7 +156,7 @@ async function toolVerify({ signature }) {
     tx = txRes?.result || null;
     if (tx) summary += `; blockTime=${tx.blockTime ?? '?'}, fee=${tx.meta?.fee ?? '?'} lamports`;
   } catch { /* status already answers confirmation + success */ }
-  return ok(summary, { signature, found: true, status: st, transaction: tx ? { slot: tx.slot, blockTime: tx.blockTime, fee: tx.meta?.fee ?? null, err: tx.meta?.err ?? null } : null });
+  return ok(summary, { signature, found: true, verified, status: st, transaction: tx ? { slot: tx.slot, blockTime: tx.blockTime, fee: tx.meta?.fee ?? null, err: tx.meta?.err ?? null } : null });
 }
 
 // ---------- tool registry ----------
@@ -179,7 +200,7 @@ const TOOLS = [
   },
   {
     name: 'verify',
-    description: 'Verify a broadcast transaction by signature via a public Solana RPC: confirmation status, success/failure, slot and fee. Read-only.',
+    description: 'Verify a broadcast transaction by signature via a public Solana RPC. Reports verified ONLY for a well-formed status with err exactly null and confirmation confirmed or finalized; a processed-only or malformed status is reported NOT verified. Read-only.',
     inputSchema: { type: 'object', additionalProperties: false, properties: { signature: { type: 'string', description: 'Transaction signature (base58)' } }, required: ['signature'] },
     run: toolVerify,
   },
@@ -198,7 +219,7 @@ async function handle(msg) {
     case 'initialize':
       return reply(id, {
         protocolVersion: PROTOCOL_VERSION,
-        serverInfo: { name: 'agentonly', version: '1.1.0' },
+        serverInfo: { name: 'agentonly', version: '1.1.5' },
         capabilities: { tools: {} },
       });
     case 'notifications/initialized':
