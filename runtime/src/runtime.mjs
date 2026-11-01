@@ -20,7 +20,7 @@
 //           → receipt.
 
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   accessSync,
   chmodSync,
@@ -28,6 +28,7 @@ import {
   existsSync,
   lstatSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from 'node:fs';
 import {
@@ -51,16 +52,26 @@ import {
   legacyMessageBytes,
   parseStrictDecimal,
   serializedTxKind,
+  stableStringify,
   tradeAccountSets,
   validateIntent,
 } from './intent.mjs';
 
 export {
+  PLATFORM_PROGRAMS,
+  TOKEN_2022_PROGRAM,
+  TOKEN_PROGRAM,
   WSOL_MINT,
   associatedTokenAddress,
   deriveIntent,
+  distributorClaimPda,
+  engineConfigPda,
+  engineMetaPda,
+  enginePricePda,
   parseStrictDecimal,
+  registrationPda,
   serializedTxKind,
+  stableStringify,
   tradeAccountSets,
   validateIntent,
 } from './intent.mjs';
@@ -240,8 +251,32 @@ export function readWalletSidecar(file) {
   }
 }
 
+// Sidecar writes (repair round 3, P1-3): never through a symlink, and
+// never in place. A pre-planted symlink at the sidecar path would make
+// a plain writeFileSync overwrite whatever file it points at, and an
+// in-place write can leave a torn sidecar if the process dies midway.
+// The write goes to a fresh temp file in the SAME directory (mode
+// 0600, exclusive create) and is renamed over the target — atomic on
+// POSIX, and the rename replaces the directory entry itself rather
+// than following it. A symlinked target is refused outright.
 export function writeWalletSidecar(file, sidecar) {
-  writeFileSync(walletSidecarPath(file), JSON.stringify(sidecar, null, 2) + '\n', { mode: 0o600 });
+  const p = walletSidecarPath(file);
+  let stat = null;
+  try { stat = lstatSync(p); } catch { /* absent: the normal case */ }
+  if (stat?.isSymbolicLink()) {
+    throw new RuntimeError(
+      'SIDECAR_SYMLINK',
+      `refusing to write the wallet sidecar through a symlink: ${p} — a planted link could redirect the write onto another file. Remove the link (or pass the real keypair path) and retry.`,
+      { file },
+    );
+  }
+  if (stat && !stat.isFile()) {
+    throw new RuntimeError('SIDECAR_INVALID', `wallet sidecar path is not a regular file: ${p}`);
+  }
+  const tmpPath = `${p}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
+  writeFileSync(tmpPath, JSON.stringify(sidecar, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  renameSync(tmpPath, p);
+  try { chmodSync(p, 0o600); } catch { /* best effort on non-POSIX */ }
 }
 
 // The sidecar is integrity-bound to the wallet it describes (P1-g): it
@@ -411,6 +446,55 @@ export function fingerprintOf(transactionBase64) {
   return createHash('sha256').update(Buffer.from(transactionBase64, 'base64')).digest('hex');
 }
 
+// Approval-token policy binding (repair round 3, P0-1).
+//
+// Rounds 1–2 bound approval to the transaction BYTES alone: the
+// fingerprint hashed only the serialized transaction, while the
+// send-time economic checks read the card's `validation` fields. Those
+// fields live on the same editable card as everything else, so an
+// attacker who altered the policy — minimum out, fee ceiling, max
+// debit, amount — AND the card's displayed copies consistently kept
+// the same fingerprint and the owner's approval still matched. The
+// approval token now hashes the transaction fingerprint PLUS a
+// canonical serialization of the validated intent record: mint, side,
+// venue, amountInRaw, minimumAmountOutRaw, expectedAmountOutRaw,
+// maxSolDebitLamports, feeCeilingLamports, blockhash. Altering any
+// policy field after approval changes the recomputed token, and the
+// send refuses (POLICY_BINDING_MISMATCH) before anything is signed.
+export function policyFingerprintOf(p) {
+  return createHash('sha256').update(stableStringify({
+    policyVersion: 1,
+    transactionFingerprint: p.transactionFingerprint,
+    mint: p.mint,
+    side: p.side,
+    venue: p.venue ?? null,
+    amountInRaw: String(p.amountInRaw),
+    minimumAmountOutRaw: String(p.minimumAmountOutRaw),
+    expectedAmountOutRaw: String(p.expectedAmountOutRaw),
+    maxSolDebitLamports: String(p.maxSolDebitLamports),
+    feeCeilingLamports: String(p.feeCeilingLamports),
+    blockhash: p.blockhash,
+  })).digest('hex');
+}
+
+// The policy fingerprint recomputed from a card's own fields — the
+// send-time check compares this against the card's approval token.
+export function cardPolicyFingerprint(card) {
+  const v = card.validation ?? {};
+  return policyFingerprintOf({
+    transactionFingerprint: card.fingerprint,
+    mint: v.mint,
+    side: v.side,
+    venue: v.venue,
+    amountInRaw: v.amountInRaw,
+    minimumAmountOutRaw: v.minimumAmountOutRaw,
+    expectedAmountOutRaw: v.expectedAmountOutRaw,
+    maxSolDebitLamports: v.maxSolDebitLamports,
+    feeCeilingLamports: v.feeCeilingLamports,
+    blockhash: card.blockhash,
+  });
+}
+
 function describeSimulationFailure(sim) {
   const parts = [`simulation FAILED (layer: ${sim.layer ?? 'unknown'})`];
   if (sim.name) parts.push(`error: ${sim.name}${sim.engineCode != null ? ` (engine code ${sim.engineCode})` : ''}`);
@@ -421,7 +505,7 @@ function describeSimulationFailure(sim) {
 // Runs eligibility → quote → build against the gateway; decodes the
 // build's bytes into an intent and validates it against the request, the
 // build response, and the canonical token record; only then returns an
-// approval card (version 2). Writes nothing; the CLI decides where the
+// approval card (version 3). Writes nothing; the CLI decides where the
 // card file goes.
 //
 // opts: { wallet (base58), mint, side, amount (UI decimal string),
@@ -547,8 +631,20 @@ export async function prepareTrade(opts) {
   };
 
   const fingerprint = fingerprintOf(build.transaction_base64);
+  const approvalToken = policyFingerprintOf({
+    transactionFingerprint: fingerprint,
+    mint: validation.mint,
+    side: validation.side,
+    venue: validation.venue,
+    amountInRaw: validation.amountInRaw,
+    minimumAmountOutRaw: validation.minimumAmountOutRaw,
+    expectedAmountOutRaw: validation.expectedAmountOutRaw,
+    maxSolDebitLamports: validation.maxSolDebitLamports,
+    feeCeilingLamports: validation.feeCeilingLamports,
+    blockhash: intent.recentBlockhash,
+  });
   const card = {
-    version: 2,
+    version: 3,
     runtime: 'agentonly-runtime',
     runtimeVersion: RUNTIME_VERSION,
     createdAt: new Date().toISOString(),
@@ -581,7 +677,7 @@ export async function prepareTrade(opts) {
     lastValidBlockHeight: build.last_valid_block_height,
     transactionBase64: build.transaction_base64,
     fingerprint,
-    approvalToken: fingerprint,
+    approvalToken,
   };
   return card;
 }
@@ -605,9 +701,11 @@ export function formatCard(card) {
     lines.push(...intentSummaryLines(card.intent));
   }
   lines.push(`  expires:   after block height ${card.lastValidBlockHeight}`);
-  lines.push(`  card fingerprint (approval token): ${card.fingerprint}`);
+  lines.push(`  build fingerprint (transaction bytes only): ${card.fingerprint}`);
+  lines.push(`  approval token (binds the build AND the economic policy above —`);
+  lines.push(`  mint, side, venue, amounts, bounds, blockhash): ${card.approvalToken}`);
   lines.push('To approve, the owner runs:');
-  lines.push(`  agentonly-runtime send --file <keypair> --card ${card.cardFile ?? './approval-card.json'} --approve ${card.fingerprint}`);
+  lines.push(`  agentonly-runtime send --file <keypair> --card ${card.cardFile ?? './approval-card.json'} --approve ${card.approvalToken}`);
   return lines.join('\n');
 }
 
@@ -972,11 +1070,14 @@ export function assertSimulationStatesComplete(preStates, postStates, addresses,
     }
     if (!post) return;
     const wasTokenData = pre && pre.data.length >= 72 && (pre.owner === TOKEN_PROGRAM || pre.owner === TOKEN_2022_PROGRAM);
-    if (post.data.length > 0 && post.data.length < 72 && (tokenAccountAddrs.has(addr) || wasTokenData)) {
-      refuse(`account ${addr} carries ${post.data.length} bytes of post-simulation data — not a decodable token account`);
-    }
-    if (wasTokenData && post.data.length >= 72 && !parseTokenAccountData(post.data)) {
-      refuse(`account ${addr} held a token account before the trade but its post-simulation data does not decode`);
+    // Repair round 3, P1-4: a PRESENT requested token account whose
+    // post-simulation data is empty or short is malformed — it is NOT
+    // a zero balance. The round-2 check required length > 0 before
+    // refusing, so an account emptied to zero bytes read as "no
+    // balance change" and passed. Token data is decodable or the send
+    // refuses; there is no third state.
+    if ((tokenAccountAddrs.has(addr) || wasTokenData) && !parseTokenAccountData(post.data)) {
+      refuse(`account ${addr} is present in the post-simulation states with ${post.data.length} bytes of data — not a decodable token account`);
     }
   });
 }
@@ -1066,11 +1167,25 @@ export function enforceEconomicBounds(card, deltas) {
     }
   } else {
     const amountRaw = BigInt(card.validation.amountInRaw);
-    if (tokenDelta > -amountRaw) {
+    // Repair round 3, P0-2: the sell debit must be EXACT. Round 2
+    // refused only an UNDER-debit (tokenDelta > -amountRaw), so a
+    // build whose simulation debited MORE than the approved amount —
+    // 200 tokens against an approved 100-token sell — passed. The
+    // simulated wallet token delta must equal -amountInRaw exactly;
+    // both directions refuse. No tolerance is granted: a build whose
+    // net wallet token movement is anything other than the approved
+    // sell amount is not the trade the owner approved. (This also
+    // refuses, fail-closed as before, a sell whose bundled distributor
+    // settle pays out into the same ATA inside the same transaction —
+    // the net delta then differs from the swap leg alone. That is the
+    // pre-existing under-debit behavior, kept deliberately rather than
+    // papered over with an allowance.)
+    if (tokenDelta !== -amountRaw) {
       throw new RuntimeError(
         'ECONOMIC_BOUND_EXCEEDED',
-        `the signed-byte simulation debits only ${-tokenDelta} raw units of the token, less than the ` +
-          `approved sell amount of ${amountRaw}. Refusing.`,
+        tokenDelta < -amountRaw
+          ? `the signed-byte simulation debits ${-tokenDelta} raw units of the token, MORE than the approved sell amount of ${amountRaw}. Refusing — the build takes more than the card approved.`
+          : `the signed-byte simulation debits only ${-tokenDelta} raw units of the token, less than the approved sell amount of ${amountRaw}. Refusing.`,
         { tokenDelta: tokenDelta.toString() },
       );
     }
@@ -1111,13 +1226,18 @@ export async function sendCard(opts) {
     throw new RuntimeError('INVALID_ARGS', 'send requires a signer: a local keypair (--file) or an external signer (--signer-type external --external-signer <executable-path> --wallet <address>)');
   }
 
-  // 1. Approval must name THIS card's exact build.
-  if (!approve || approve !== card.fingerprint || approve !== card.approvalToken) {
+  // 1. Approval must name THIS card's approval token. Since repair
+  //    round 3 (P0-1) the token binds the transaction bytes AND the
+  //    card's full economic policy — see policyFingerprintOf. The
+  //    step-6 recompute is what enforces the binding; this step checks
+  //    the owner actually approved the token this card carries.
+  if (!approve || approve !== card.approvalToken) {
     throw new RuntimeError(
       'APPROVAL_MISMATCH',
-      `refusing to sign: --approve does not match this card's fingerprint. ` +
-        `The approval token binds one wallet, one mint, one side, one amount and ` +
-        `one simulated build. Re-read the card and approve its exact fingerprint: ${card.fingerprint}`,
+      `refusing to sign: --approve does not match this card's approval token. ` +
+        `The token binds one wallet, one mint, one side, one venue, one amount, ` +
+        `the full economic bounds, and one simulated build. Re-read the card and ` +
+        `approve its exact token: ${card.approvalToken}`,
     );
   }
   if (fingerprintOf(card.transactionBase64) !== card.fingerprint) {
@@ -1171,6 +1291,21 @@ export async function sendCard(opts) {
     }
   }
 
+  // 5b. Canonical binding in the CORE send path (repair round 3,
+  //     P1-2): the card must name its venue, and the canonical token
+  //     record must be present — supplied by the caller or fetched
+  //     here (fail closed: fetchTokenRecord refuses on any fetch
+  //     failure). Round 2 enforced this only in the CLI, so a direct
+  //     sendCard caller could skip pool binding entirely; the core
+  //     library now refuses on its own.
+  if (!card.venue) {
+    throw new RuntimeError(
+      'CANONICAL_BINDING_MISSING',
+      'refusing to sign: this card names no venue. The core send path requires the card to be bound to the venue it was built for and to the canonical token record for its mint. Discard it and prepare again.',
+    );
+  }
+  const tokenJson = opts.tokenJson ?? (await fetchTokenRecord(fetchImpl, card.mint));
+
   // 6. Intent: re-derive from the card's bytes and deep-compare with the
   //    intent stored at prepare time; re-validate against the card's own
   //    claims; cross-check every friendly field the owner read against
@@ -1195,7 +1330,7 @@ export async function sendCard(opts) {
       mint: card.mint,
       side: card.side,
       venue: card.venue ?? null,
-      tokenJson: opts.tokenJson,
+      tokenJson,
     });
   } catch (e) {
     throw asRuntimeError(e);
@@ -1215,6 +1350,20 @@ export async function sendCard(opts) {
     throw new RuntimeError(
       'INTENT_CARD_MISMATCH',
       'refusing to sign: the card\u2019s displayed fields (amount, minimum out, bounds, blockhash) do not match its validated intent record — the card was altered after preparation. Discard it and prepare again.',
+    );
+  }
+  // Policy binding (repair round 3, P0-1): the friendly cross-check
+  // above compares card fields against EACH OTHER, so editing the
+  // policy and its displayed copies consistently passes it. The
+  // approval token is the anchor: recompute the policy fingerprint
+  // from the card's validated record + blockhash + build fingerprint
+  // and require it to equal the token the owner approved. Any
+  // post-approval alteration of any bound breaks it here, before
+  // signing, regardless of how consistently the card was edited.
+  if (cardPolicyFingerprint(card) !== card.approvalToken) {
+    throw new RuntimeError(
+      'POLICY_BINDING_MISMATCH',
+      'refusing to sign: the card\u2019s economic policy does not hash to its approval token — a policy field (mint, side, venue, amount, minimum out, expected out, max debit, fee ceiling, blockhash) was altered after approval, whether or not the displayed fields were edited to match. The approval no longer covers this policy. Discard the card and prepare again.',
     );
   }
 
@@ -1249,7 +1398,7 @@ export async function sendCard(opts) {
   //    from the simulation's account states. Incomplete or malformed
   //    simulation state refuses (P0-2) — there is no pass-through. Any
   //    failure here means sendRawTransaction is never reached.
-  const sets = tradeAccountSets({ wallet: signerAddress, mint: card.mint, tokenJson: opts.tokenJson });
+  const sets = tradeAccountSets({ wallet: signerAddress, mint: card.mint, tokenJson });
   const addresses = [...new Set([
     ...(card.intent?.writableAccounts ?? []),
     signerAddress,
@@ -1271,7 +1420,12 @@ export async function sendCard(opts) {
   }
   assertSimulationStatesComplete(
     preStates, sim.accounts, addresses,
-    new Set([...sets.walletAtas, sets.wsolAta, ...sets.poolAccounts]),
+    // The accounts whose post-states must decode as token accounts:
+    // the wallet's own ATAs, its WSOL ATA, and the pool's token
+    // accounts/vaults. (The pool state PDAs in sets.poolAccounts are
+    // program accounts — their data is not token data and they are
+    // not held to the token decode rule.)
+    new Set([...sets.walletAtas, sets.wsolAta, ...sets.poolTokenAccounts]),
   );
   const effects = computeEffects(preStates, sim.accounts, addresses);
   // Aggregate SOL accounting: the wallet's own lamport delta PLUS its
@@ -1317,10 +1471,26 @@ export async function sendCard(opts) {
   const mintPk = new PublicKey(card.mint);
   const before = await snapshotBalances(connection, ownerPk, mintPk);
   const sig = await connection.sendRawTransaction(signedBytes, { maxRetries: 3 });
-  await connection.confirmTransaction(
+  const confirmation = await connection.confirmTransaction(
     { signature: sig, blockhash: card.blockhash, lastValidBlockHeight: card.lastValidBlockHeight },
     'confirmed',
   );
+  // A confirmed transaction can still have FAILED on-chain (repair
+  // round 3, P1-5): confirmTransaction resolves with the error in its
+  // result rather than throwing in every strategy, and round 2 ignored
+  // the result entirely — a failed trade could be reported as a
+  // successful receipt. The confirmation error is checked explicitly;
+  // an errored confirmation is a failure, never a receipt.
+  const confirmationError = confirmation?.value?.err ?? null;
+  if (confirmationError) {
+    throw new RuntimeError(
+      'TRANSACTION_FAILED_ONCHAIN',
+      `transaction ${sig} was confirmed but FAILED on-chain: ${JSON.stringify(confirmationError)}. ` +
+        `It is reported as a failure, not a receipt — the trade did not execute. Investigate the ` +
+        `failure before preparing again; do not treat this signature as a completed trade.`,
+      { signature: sig, confirmationError },
+    );
+  }
   const after = await snapshotBalances(connection, ownerPk, mintPk);
   return {
     mode: 'broadcast',

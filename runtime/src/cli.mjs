@@ -15,11 +15,11 @@
 //                                   [--out ./approval-card.json]
 //   prepare --signer-type external --wallet <address> --mint <mint>
 //           --side buy|sell --amount <ui> [--out ./approval-card.json]
-//   send --file <keypair> --card <card.json> --approve <fingerprint>
+//   send --file <keypair> --card <card.json> --approve <approval-token>
 //        [--dry-run] [--signer-type ...]
 //   send --signer-type external --external-signer <executable-path>
 //        [--external-signer-arg <value> ...]
-//        --wallet <address> --card <card.json> --approve <fingerprint>
+//        --wallet <address> --card <card.json> --approve <approval-token>
 //        [--dry-run]
 //
 // Exit codes: 0 ok · 1 refusal/error · 3 persistence handshake mismatch.
@@ -226,7 +226,7 @@ async function main() {
 
   if (cmd === 'send') {
     if (!flags.card || !flags.approve) {
-      throw new RuntimeError('INVALID_ARGS', 'send requires --card and --approve <fingerprint> (plus --file, or --signer-type external --external-signer <executable-path> --wallet <address>)');
+      throw new RuntimeError('INVALID_ARGS', 'send requires --card and --approve <approval-token> (plus --file, or --signer-type external --external-signer <executable-path> --wallet <address>)');
     }
     let card;
     try {
@@ -286,8 +286,8 @@ async function main() {
   console.error('  agentonly-runtime inspect <mint>');
   console.error('  agentonly-runtime prepare --file <keypair> --mint <mint> --side buy|sell --amount <ui> [--signer-type own|sandbox] [--max-fee-lamports <n>] [--out ./approval-card.json]');
   console.error('  agentonly-runtime prepare --signer-type external --wallet <address> --mint <mint> --side buy|sell --amount <ui> [--out ./approval-card.json]');
-  console.error('  agentonly-runtime send --file <keypair> --card <card.json> --approve <fingerprint> [--dry-run]');
-  console.error('  agentonly-runtime send --signer-type external --external-signer <executable-path> [--external-signer-arg <value> ...] --wallet <address> --card <card.json> --approve <fingerprint> [--dry-run]');
+  console.error('  agentonly-runtime send --file <keypair> --card <card.json> --approve <approval-token> [--dry-run]');
+  console.error('  agentonly-runtime send --signer-type external --external-signer <executable-path> [--external-signer-arg <value> ...] --wallet <address> --card <card.json> --approve <approval-token> [--dry-run]');
   process.exit(2);
 }
 

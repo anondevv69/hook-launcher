@@ -221,6 +221,58 @@ export function canonicalPoolVaults(tokenJson) {
   return [...vaults];
 }
 
+// ---------------------------------------------------------------------------
+// Platform PDA derivations (repair round 3, P1-1)
+//
+// The AgentOnly platform programs are custom (not Anchor): their trade
+// instructions carry 1–2 byte tag discriminators and fixed account
+// layouts — the layouts the gateway's Trade Kit builds (tradekit.mjs,
+// mirrored byte-for-byte from hook.mjs). The state accounts those
+// instructions may touch are deterministic PDAs of the mint / wallet /
+// holder, or addresses the canonical record names. Deriving them here
+// lets instruction classification validate account SHAPES, not just
+// program identity: a platform instruction whose writable accounts are
+// not the trade's own derived state accounts is a data-only state
+// mutation riding the trade, and refuses.
+// ---------------------------------------------------------------------------
+
+export const INSTRUCTIONS_SYSVAR = 'Sysvar1nstructions1111111111111111111111111';
+
+// The Meteora DBC swap discriminator, observed in production gateway
+// builds (AGTR buy, 2026-10-31: 31-byte instruction data beginning
+// b75d992818e6c297). A venue instruction without it is not the swap
+// the gateway builds.
+export const DBC_SWAP_DISCRIMINATOR = 'b75d992818e6c297';
+
+function pdaFor(seeds, programId) {
+  return PublicKey.findProgramAddressSync(
+    seeds.map((s) => (Buffer.isBuffer(s) ? s : new PublicKey(s).toBuffer())),
+    new PublicKey(programId),
+  )[0].toBase58();
+}
+
+export function registrationPda(wallet) {
+  return pdaFor([Buffer.from('registration'), wallet], PLATFORM_PROGRAMS.registry);
+}
+export function engineConfigPda(mint) {
+  return pdaFor([Buffer.from('config'), mint], PLATFORM_PROGRAMS.engine);
+}
+export function enginePricePda(mint) {
+  return pdaFor([Buffer.from('price'), mint], PLATFORM_PROGRAMS.engine);
+}
+export function engineMetaPda(mint) {
+  return pdaFor([Buffer.from('extra-account-metas'), mint], PLATFORM_PROGRAMS.engine);
+}
+// One derivation, two generations: v2 holder records are keyed by the
+// owner wallet, v3 by the holder TOKEN ACCOUNT (tradekit holderPda /
+// holderPdaV3 share the ['holder', mint, key] seed layout).
+export function engineHolderPda(mint, key) {
+  return pdaFor([Buffer.from('holder'), mint, key], PLATFORM_PROGRAMS.engine);
+}
+export function distributorClaimPda(mint, holder) {
+  return pdaFor([Buffer.from('claim'), mint, holder], PLATFORM_PROGRAMS.distributor);
+}
+
 // The account sets the trade is allowed to touch, derived from the card
 // context + canonical record:
 //  - walletAtas: the wallet's token accounts for the card mint (both
@@ -244,15 +296,32 @@ export function tradeAccountSets({ wallet, mint, tokenJson }) {
   const wsolAta = associatedTokenAddress(new PublicKey(WSOL_MINT), owner, TOKEN_PROGRAM).toBase58();
   const pools = canonicalPools(tokenJson);
   const poolAccounts = new Set(pools);
+  const poolTokenAccounts = new Set();
   for (const p of pools) {
     const poolPk = new PublicKey(p);
     for (const tp of [TOKEN_PROGRAM, TOKEN_2022_PROGRAM]) {
-      poolAccounts.add(associatedTokenAddress(mintPk, poolPk, tp).toBase58());
+      const ata = associatedTokenAddress(mintPk, poolPk, tp).toBase58();
+      poolAccounts.add(ata);
+      poolTokenAccounts.add(ata);
     }
   }
-  for (const v of canonicalPoolVaults(tokenJson)) poolAccounts.add(v);
+  for (const v of canonicalPoolVaults(tokenJson)) { poolAccounts.add(v); poolTokenAccounts.add(v); }
   const permitted = new Set([wallet, ...walletAtas, wsolAta, ...poolAccounts]);
-  return { walletAtas, wsolAta, pools, poolAccounts: [...poolAccounts], permitted };
+  // Platform state accounts (repair round 3, P1-1): the derived PDAs
+  // and record-named distributor accounts the platform instructions of
+  // a trade may legitimately name. distState/distVault come from the
+  // canonical record (addresses.distributor) and stay null when the
+  // record carries none — the shape checks then skip those positions.
+  const dist = tokenJson?.addresses?.distributor ?? {};
+  const platform = {
+    regPda: registrationPda(wallet),
+    engineConfig: engineConfigPda(mint),
+    enginePrice: enginePricePda(mint),
+    engineMeta: engineMetaPda(mint),
+    distState: typeof dist.state === 'string' && dist.state ? dist.state : null,
+    distVault: typeof dist.vault === 'string' && dist.vault ? dist.vault : null,
+  };
+  return { walletAtas, wsolAta, pools, poolAccounts: [...poolAccounts], poolTokenAccounts: [...poolTokenAccounts], permitted, platform };
 }
 
 function isWritableIndex(header, accountCount, i) {
@@ -271,7 +340,16 @@ function normalizeInstructions(compiled, keys, dataOf) {
     const writableAccounts = (ix.accounts ?? ix.accountKeyIndexes ?? [])
       .filter((ai) => ix._writable?.has(ai))
       .map((ai) => keys[ai]?.toBase58() ?? 'unknown');
-    const out = { programId, kind: kindSummary(programId, tag), tag, accounts, writableAccounts };
+    const out = {
+      programId, kind: kindSummary(programId, tag), tag, accounts, writableAccounts,
+      // Raw data shape (repair round 3, P1-1): instruction classification
+      // validates discriminators and data lengths, not just the first
+      // byte — both fields are JSON-safe so the intent survives the
+      // approval-card round-trip and the send-time deep-compare binds
+      // them exactly.
+      dataLength: data ? data.length : 0,
+      dataPrefix: data ? Buffer.from(data).subarray(0, 8).toString('hex') : '',
+    };
     // Parsed transfer payloads — JSON-safe strings only, so the intent
     // survives the approval-card file round-trip and the send-time
     // deep-compare still binds these exact values.
@@ -425,6 +503,113 @@ function unclassified(ix, why) {
   );
 }
 
+// Platform-program shape validation (repair round 3, P1-1).
+//
+// Round 2 classified ANY Engine/Registry/Distributor instruction as
+// 'platform' on program identity alone. That admits arbitrary payloads
+// on those programs — including data-only state mutations the balance
+// checks cannot see (a state account's data changes while its lamports
+// and token balance do not). The platform programs are custom, with
+// 1–2 byte tag discriminators and fixed account layouts — exactly the
+// layouts the gateway's Trade Kit builds (tradekit.mjs instruction
+// builders, mirrored byte-for-byte from hook.mjs). Only those shapes
+// belong to a trade:
+//
+//   Registry    register  data [0, kind]      [wallet, regPda, System]
+//   Engine      sync      data [4, 0]         [wallet, mint, config, wallet, holder, System, regPda]
+//   Engine      syncGate  data [7]            [wallet, mint, config, wallet, holder, System, gate, destAta, InstructionsSysvar]
+//   Engine      crankCp   data [5]            [config, price, baseVault, quoteVault]
+//   Engine      crankDbc  data [8]            [config, price, pool]
+//   Distributor settle    data [3]            [payer, holder, holderAta, mint, distState, distVault, claimPda, Token2022, System, …tail]
+//
+// Every fixed position that names state must name THE derived/recorded
+// account for this mint/wallet/holder — an instruction pointed at a
+// lookalike state account refuses. Engine tag 9
+// (RefreshExtraAccountMetas) is an operator repair and is never part
+// of a trade; any other tag on any platform program refuses.
+function classifyPlatformInstruction(ix, ctx) {
+  const { wallet, mint, sets } = ctx;
+  const a = ix.accounts;
+  const P = sets.platform;
+  const shape = (why) => { throw unclassified(ix, why); };
+
+  if (ix.programId === PLATFORM_PROGRAMS.registry) {
+    if (ix.tag !== 0 || ix.dataLength !== 2) {
+      shape('the only Registry instruction in a trade is register (data [0, kind])');
+    }
+    if (a.length !== 3 || a[0] !== wallet || a[1] !== P.regPda || a[2] !== SYSTEM_PROGRAM) {
+      shape('register must name the wallet, its derived registration PDA, and the System program — nothing else');
+    }
+    return 'platform-register';
+  }
+
+  if (ix.programId === PLATFORM_PROGRAMS.distributor) {
+    if (ix.tag !== 3 || ix.dataLength !== 1) {
+      shape('the only Distributor instruction in a trade is settle (data [3])');
+    }
+    if (a.length < 9) {
+      shape(`settle carries a fixed 9-account prefix before its hook-extra tail; this one carries ${a.length} accounts`);
+    }
+    if (a[0] !== wallet) shape('settle payer is not the wallet');
+    if (a[3] !== mint) shape('settle does not name the card mint');
+    if (P.distState && a[4] !== P.distState) shape('settle state account is not the canonical record\u2019s distributor state');
+    if (P.distVault && a[5] !== P.distVault) shape('settle vault account is not the canonical record\u2019s distributor vault');
+    if (a[6] !== distributorClaimPda(mint, a[1])) {
+      shape('settle claim account is not the derived claim PDA for the holder it names');
+    }
+    if (a[7] !== TOKEN_2022_PROGRAM || a[8] !== SYSTEM_PROGRAM) {
+      shape('settle prefix must close with the Token-2022 and System programs');
+    }
+    return 'platform-settle';
+  }
+
+  // Engine. The holder position accepts either holder-record
+  // generation: owner-keyed (v2) or token-account-keyed (v3).
+  const holderOk = (acct) => acct === engineHolderPda(mint, wallet)
+    || sets.walletAtas.some((ata) => acct === engineHolderPda(mint, ata));
+  if (ix.tag === 4) {
+    if (ix.dataLength !== 2 || ix.dataPrefix !== '0400') {
+      shape('engine sync carries data [4, 0] exactly');
+    }
+    if (a.length !== 7 || a[0] !== wallet || a[3] !== wallet) shape('sync must be for the wallet itself');
+    if (a[1] !== mint) shape('sync does not name the card mint');
+    if (a[2] !== P.engineConfig) shape('sync config account is not the derived engine config PDA for this mint');
+    if (!holderOk(a[4])) shape('sync holder account is not the wallet\u2019s derived holder PDA');
+    if (a[5] !== SYSTEM_PROGRAM || a[6] !== P.regPda) shape('sync must close with the System program and the wallet\u2019s registration PDA');
+    return 'platform-sync';
+  }
+  if (ix.tag === 7) {
+    if (ix.dataLength !== 1) shape('engine syncGate carries data [7] exactly');
+    if (a.length !== 9 || a[0] !== wallet || a[3] !== wallet) shape('syncGate must be for the wallet itself');
+    if (a[1] !== mint) shape('syncGate does not name the card mint');
+    if (a[2] !== P.engineConfig) shape('syncGate config account is not the derived engine config PDA for this mint');
+    if (!holderOk(a[4])) shape('syncGate holder account is not the wallet\u2019s derived holder PDA');
+    if (a[5] !== SYSTEM_PROGRAM || a[8] !== INSTRUCTIONS_SYSVAR) {
+      shape('syncGate must carry the System program and the Instructions sysvar in their fixed positions');
+    }
+    return 'platform-sync-gate';
+  }
+  if (ix.tag === 8) {
+    if (ix.dataLength !== 1) shape('engine crankDbc carries data [8] exactly');
+    if (a.length !== 3 || a[0] !== P.engineConfig || a[1] !== P.enginePrice) {
+      shape('crankDbc must name the derived config and price PDAs for this mint');
+    }
+    if (sets.pools.length && !sets.pools.includes(a[2])) shape('crankDbc pool is not a canonical pool for this mint');
+    return 'platform-crank';
+  }
+  if (ix.tag === 5) {
+    if (ix.dataLength !== 1) shape('engine crankCp carries data [5] exactly');
+    if (a.length !== 4 || a[0] !== P.engineConfig || a[1] !== P.enginePrice) {
+      shape('crankCp must name the derived config and price PDAs for this mint');
+    }
+    if (!sets.poolAccounts.includes(a[2]) || !sets.poolAccounts.includes(a[3])) {
+      shape('crankCp vaults are not the canonical pool vaults for this mint');
+    }
+    return 'platform-crank';
+  }
+  throw unclassified(ix, `engine instruction tag ${ix.tag} is not part of a trade — the trade vocabulary is sync (4), crankCp (5), syncGate (7), crankDbc (8); tag 9 (RefreshExtraAccountMetas) is an operator repair, never bundled into a trade`);
+}
+
 // ctx: { wallet, mint, side, venueProgram, sets (tradeAccountSets) }
 function classifyInstruction(ix, ctx) {
   const { wallet, mint, side, venueProgram, sets } = ctx;
@@ -438,10 +623,20 @@ function classifyInstruction(ix, ctx) {
   }
   if (pid === MEMO_PROGRAM || pid === MEMO_PROGRAM_V1) return 'memo';
   if (pid === PLATFORM_PROGRAMS.engine || pid === PLATFORM_PROGRAMS.registry || pid === PLATFORM_PROGRAMS.distributor) {
-    return 'platform';
+    return classifyPlatformInstruction(ix, ctx);
   }
   if (pid === PLATFORM_PROGRAMS.dbc || pid === PLATFORM_PROGRAMS.house) {
-    if (!venueProgram || pid === venueProgram) return 'venue-swap';
+    if (!venueProgram || pid === venueProgram) {
+      // Discriminator validation (repair round 3, P1-1): a venue
+      // instruction must BE the swap, not just run on the venue
+      // program. The DBC swap carries the 8-byte discriminator the
+      // production gateway emits; anything else on the program —
+      // including data-only payloads — refuses.
+      if (pid === PLATFORM_PROGRAMS.dbc && ix.dataPrefix !== DBC_SWAP_DISCRIMINATOR) {
+        throw unclassified(ix, 'venue instruction does not carry the DBC swap discriminator — it is not the swap the gateway builds');
+      }
+      return 'venue-swap';
+    }
     throw unclassified(ix, 'instruction runs on a venue program that is not the quoted venue');
   }
   if (pid === ATA_PROGRAM) {
@@ -576,10 +771,31 @@ export function validateIntent(intent, ctx) {
   let venueProgram = null;
   if (venue) venueProgram = VENUE_PROGRAM_BY_VENUE[venue] ?? null;
 
+  // Canonical binding (repair round 3, P1-2): when a venue is named,
+  // the canonical token record is REQUIRED — it is what binds the
+  // build to the token's real pool and platform state accounts. A
+  // missing record, or a record that names no pool for the curve
+  // venue, refuses here in the shared validator (not only in CLI
+  // plumbing), so no caller can validate a build against nothing.
+  if (venue && !ctx.tokenJson) {
+    throw new IntentError(
+      'CANONICAL_RECORD_REQUIRED',
+      `intent validation for venue '${venue}' requires the canonical token record — without it the build cannot be bound to the token's pool and platform state accounts. Refusing.`,
+      { venue, mint },
+    );
+  }
+
   // P0-1b: EVERY instruction must classify into the approved trade
   // shape. This is what stops a bundled extra transfer riding along
   // with a legitimate swap.
   const sets = tradeAccountSets({ wallet, mint, tokenJson: ctx.tokenJson });
+  if (venue === 'curve' && sets.pools.length === 0) {
+    throw new IntentError(
+      'CANONICAL_RECORD_REQUIRED',
+      'the canonical token record names no pool for this mint — the build cannot be bound to a canonical curve pool. Refusing.',
+      { venue, mint },
+    );
+  }
   for (const ix of intent.instructions) {
     classifyInstruction(ix, { wallet, mint, side: ctx.side, venueProgram, sets });
   }
