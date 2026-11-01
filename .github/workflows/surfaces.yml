@@ -39,8 +39,18 @@ jobs:
         # The manifest signature is verified against the pinned release
         # key BEFORE any artifact is fetched or executed, and the
         # artifacts are rebuilt from the checkout and hash-compared.
-        # --allow-commit-drift: on PR branches the live manifest still
-        # names the last released commit; the strict sourceCommit check
-        # is enforced at release time, when the manifest is republished
-        # from the merged/tagged commit.
+        #
+        # Commit-drift policy (repair round 3, P1-7): the drift
+        # allowance is scoped to pull_request runs ONLY. On a PR the
+        # live manifest necessarily names the last merged release,
+        # whose sourceCommit cannot equal the PR head, so the drift
+        # report is informational there. On push (including merges
+        # into main) and on the schedule the strict binding applies:
+        # the live manifest's sourceCommit must equal the checked-out
+        # commit, so once the release branch merges, any drift between
+        # the published release and main fails this job.
+        if: github.event_name == 'pull_request'
         run: node scripts/verify-release.mjs --allow-commit-drift
+      - name: Verify published artifacts against the release manifest (strict)
+        if: github.event_name != 'pull_request'
+        run: node scripts/verify-release.mjs
