@@ -19,7 +19,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -98,6 +98,101 @@ const work = mkdtempSync(join(ROOT, 'dist', 'build-test-'));
     else console.log('ok: AONLY_DIST outside the repository root refuses before any deletion');
   } finally {
     rmSync(planted, { force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Repair round 5 regressions.
+// P0-2 (AONLY_DIST hardening): the repo root itself, a symlinked path
+// escaping dist/, an occupied non-artifact directory, and a
+// .git-containing directory must ALL refuse before any deletion,
+// with the would-be victims intact. (Round 4's lexical test let the
+// root and the symlinked parent through — these cases are only run
+// against the hardened build.)
+// Item 1 (tracked symlink sources): a symlink staged into the index
+// under runtime/ must refuse the build, naming the file, before any
+// staging copies its target's bytes.
+// ---------------------------------------------------------------------------
+{
+  const buildRefusal = (outDir) => {
+    try {
+      execFileSync(process.execPath, [BUILD], {
+        cwd: ROOT, env: { ...process.env, AONLY_DIST: outDir }, stdio: 'pipe',
+      });
+      return null;
+    } catch (e) {
+      return `${e.stdout ?? ''}${e.stderr ?? ''}`;
+    }
+  };
+
+  // (a) AONLY_DIST = the repository root itself.
+  {
+    const out = buildRefusal(ROOT);
+    if (!out) fail('build accepted AONLY_DIST=<repo root> — it would recursively delete the repository');
+    else if (!existsSync(join(ROOT, 'scripts', 'build-release.mjs'))) fail('AONLY_DIST=<repo root> refusal came too late: the tree was damaged');
+    else console.log('ok: AONLY_DIST=<repo root> refuses, tree intact');
+  }
+
+  // (b) AONLY_DIST through a symlink planted inside dist/ pointing outside.
+  {
+    const victim = mkdtempSync(join('/tmp', 'aonly-dist-victim-'));
+    const sentinel = join(victim, 'keep.txt');
+    writeFileSync(sentinel, 'outside the repo — must survive\n');
+    const link = join(ROOT, 'dist', 'escape-link');
+    rmSync(link, { force: true });
+    symlinkSync(victim, link);
+    try {
+      const out = buildRefusal(link);
+      if (!out) fail('build accepted an AONLY_DIST escaping dist/ through a planted symlink');
+      else if (readFileSync(sentinel, 'utf8') !== 'outside the repo — must survive\n') fail('symlinked AONLY_DIST refusal came too late: the outside directory was damaged');
+      else console.log('ok: AONLY_DIST through a symlink inside dist/ refuses, outside dir intact');
+    } finally {
+      rmSync(link, { force: true });
+      rmSync(victim, { recursive: true, force: true });
+    }
+  }
+
+  // (c) AONLY_DIST = an existing dist/ subdirectory holding a foreign file.
+  {
+    const occupied = join(work, 'occupied');
+    mkdirSync(occupied, { recursive: true });
+    const foreign = join(occupied, 'important.txt');
+    writeFileSync(foreign, 'not a release artifact\n');
+    const out = buildRefusal(occupied);
+    if (!out) fail('build accepted an occupied AONLY_DIST with a foreign file — it would delete it');
+    else if (!existsSync(foreign)) fail('occupied AONLY_DIST refusal came too late: the foreign file was deleted');
+    else console.log('ok: occupied AONLY_DIST with a foreign file refuses, file intact');
+  }
+
+  // (d) AONLY_DIST containing a .git entry.
+  {
+    const withGit = join(work, 'with-git');
+    mkdirSync(join(withGit, '.git'), { recursive: true });
+    const out = buildRefusal(withGit);
+    if (!out) fail('build accepted an AONLY_DIST containing .git');
+    else if (!existsSync(join(withGit, '.git'))) fail('.git AONLY_DIST refusal came too late: .git was deleted');
+    else console.log('ok: AONLY_DIST containing .git refuses, intact');
+  }
+
+  // (e) Tracked symlink source under runtime/.
+  {
+    const outsideFile = join(work, 'outside-source.txt');
+    writeFileSync(outsideFile, 'host bytes that must never ship\n');
+    const linkRel = 'runtime/src/planted-link.mjs';
+    const linkAbs = join(ROOT, linkRel);
+    rmSync(linkAbs, { force: true });
+    symlinkSync(outsideFile, linkAbs);
+    try {
+      execFileSync('git', ['add', '--', linkRel], { cwd: ROOT, stdio: 'pipe' });
+      const out = buildRefusal(join(work, 'out-symlink'));
+      if (!out) fail('build accepted a tracked symlink under runtime/src — staging would package its target');
+      else if (!out.includes('planted-link')) fail(`tracked-symlink refusal did not name the file (got: ${out.split('\n')[0]})`);
+      else if (readFileSync(outsideFile, 'utf8') !== 'host bytes that must never ship\n') fail('tracked-symlink test damaged its outside target');
+      else console.log('ok: tracked symlink under runtime/src refuses the build and names the file');
+    } finally {
+      try { execFileSync('git', ['reset', '-q', '--', linkRel], { cwd: ROOT, stdio: 'pipe' }); } catch { /* best effort */ }
+      rmSync(linkAbs, { force: true });
+    }
   }
 }
 
