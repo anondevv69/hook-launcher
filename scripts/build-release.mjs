@@ -4,7 +4,8 @@
 //
 // Outputs (into dist/ at the repo root, or $AONLY_DIST):
 //   agentonly-runtime.tar.gz  — byte-reproducible (sorted entries, fixed
-//                               mtime/owners, gzip with a zeroed timestamp)
+//                               mtime/owners, canonical staged modes, gzip
+//                               with a zeroed timestamp)
 //   agentonly-mcp.mjs         — the single-file MCP server
 //   release.json              — { product, version, sourceCommit, builtAt,
 //                                 artifacts: [{file, path, sha256, bytes}] }
@@ -17,7 +18,9 @@
 // Usage: node scripts/build-release.mjs
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync, copyFileSync, cpSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
@@ -56,14 +59,44 @@ if (!version) throw new Error('runtime/package.json has no version');
 // Deterministic tarball of the runtime source (same file set that is
 // published on agentonly.fun): bin, src, test, README, package files.
 // Plain tar via argv (no shell), then gzip with a zeroed header timestamp.
+//
+// Repair round 3.1: the tar entries' MODES must also be canonical, not
+// just mtime/owner/sort order. Tar records the working tree's modes, and
+// those depend on the build machine's umask (this VM produces 660/770;
+// a fresh git checkout is 644/755) — so a tarball built here could not
+// be reproduced from a checkout anywhere else, and CI's rebuild check
+// failed on mode bytes alone (file CONTENT was always identical).
+// Adding bits is not enough (`tar --mode='a+rX'` maps 660->664,
+// 770->777), so the file set is staged into a fresh directory, every
+// staged entry is given its exact canonical mode (dirs 0755, files
+// 0644, the CLI entrypoint 0755), and the tar is built from staging.
+const RUNTIME_ENTRIES = ['bin', 'src', 'test', 'README.md', 'package.json', 'package-lock.json', '.gitignore'];
+const stage = join(dist, '.runtime-stage');
+mkdirSync(stage, { recursive: true });
+for (const entry of RUNTIME_ENTRIES) {
+  cpSync(join(root, 'runtime', entry), join(stage, entry), { recursive: true });
+}
+const ENTRYPOINT = join(stage, 'bin', 'agentonly-runtime');
+const canonicalizeModes = (p) => {
+  const st = lstatSync(p);
+  if (st.isSymbolicLink()) return; // tar stores the link itself; none exist in runtime/ today
+  if (st.isDirectory()) {
+    chmodSync(p, 0o755);
+    for (const name of readdirSync(p)) canonicalizeModes(join(p, name));
+  } else {
+    chmodSync(p, p === ENTRYPOINT ? 0o755 : 0o644);
+  }
+};
+for (const entry of RUNTIME_ENTRIES) canonicalizeModes(join(stage, entry));
 const tarPath = join(dist, 'agentonly-runtime.tar');
 execFileSync('tar', [
   '--sort=name', '--mtime=UTC 2020-01-01', '--owner=0', '--group=0', '--numeric-owner',
-  '-cf', tarPath, 'bin', 'src', 'test', 'README.md', 'package.json', 'package-lock.json', '.gitignore',
-], { cwd: join(root, 'runtime') });
+  '-cf', tarPath, ...RUNTIME_ENTRIES,
+], { cwd: stage });
 writeFileSync(join(dist, 'agentonly-runtime.tar.gz'),
   gzipSync(readFileSync(tarPath), { level: 9, mtime: 0 }));
 rmSync(tarPath);
+rmSync(stage, { recursive: true, force: true });
 
 copyFileSync(join(root, 'mcp', 'agentonly-mcp.mjs'), join(dist, 'agentonly-mcp.mjs'));
 
