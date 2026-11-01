@@ -19,13 +19,58 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
-  chmodSync, copyFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
+  chmodSync, copyFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+// Canonical (symlink-resolved) form of a path (repair round 5,
+// P0-2): realpath the nearest EXISTING ancestor, then re-append the
+// remaining components lexically, so a not-yet-created output
+// directory still canonicalizes through its real parents. The
+// round-4 containment test compared purely lexical resolve() output,
+// which a symlinked parent defeats entirely.
+function canonicalPath(p) {
+  const abs = resolve(p);
+  const suffix = [];
+  let cur = abs;
+  for (;;) {
+    try {
+      const real = realpathSync(cur);
+      return suffix.length ? join(real, ...suffix.reverse()) : real;
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return abs;
+      suffix.push(cur.slice(parent.length + 1));
+      cur = parent;
+    }
+  }
+}
+const canonicalRoot = canonicalPath(root);
+
+// Tracked-source symlink scan (repair round 5, item 1): staging
+// copies tracked files with copyFileSync, which FOLLOWS symlinks —
+// a tracked symlink under runtime/ (or at the MCP source path) would
+// package its target's host bytes into the published artifacts.
+// Every tracked release source is lstat-checked; a symlink refuses
+// the build, naming the file. Runs BEFORE the clean-tree gate on
+// purpose: `git ls-files` reads the index, so a staged-but-
+// uncommitted symlink is refused by this check, not waved past it.
+{
+  const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root })
+    .toString().split('\0').filter(Boolean);
+  for (const rel of tracked) {
+    if (!(rel.startsWith('runtime/') || rel === 'mcp/agentonly-mcp.mjs')) continue;
+    if (lstatSync(join(root, rel)).isSymbolicLink()) {
+      throw new Error(
+        `refusing to build: tracked release source ${rel} is a symlink — staging copies file bytes through symlinks, so the release would package the link target's host bytes instead of repository content. Replace the symlink with a regular file (or remove it from the index) and build again.`,
+      );
+    }
+  }
+}
 
 // Clean-tree requirement (repair round 3, P1-7): the manifest names a
 // sourceCommit, and that claim is only meaningful if the commit fully
@@ -49,20 +94,64 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 }
 
 const dist = process.env.AONLY_DIST || join(root, 'dist');
-// Output-path safety (repair round 4, P1-7a): the build begins by
-// RECURSIVELY DELETING its output directory. Rounds 1–3 took that
-// directory from $AONLY_DIST unchecked — an environment pointing at
-// an arbitrary absolute path would be wiped before any build ran.
-// The output must now resolve INSIDE the repository root (the
-// default dist/ or a subpath of the root); anything else refuses
-// before any deletion.
+// Output-path safety (repair round 4, P1-7a; hardened in repair
+// round 5, P0-2): the build begins by RECURSIVELY DELETING its
+// output directory. Rounds 1–3 took that directory from $AONLY_DIST
+// unchecked — an environment pointing at an arbitrary absolute path
+// would be wiped before any build ran. Round 4 required the path to
+// resolve lexically inside the repo root — but lexical resolution
+// is not containment: the repo root ITSELF passed as "inside", and
+// a symlinked parent inside the repo pointing outside passed too,
+// while rmSync would have deleted through both. Now:
+//   * root and candidate are canonicalized with realpath (every
+//     existing component's symlinks resolved);
+//   * the target must be a STRICT subdirectory confined to the
+//     repo's dist/ tree (the default <root>/dist or a directory
+//     under it) — the root itself and everything outside dist/
+//     refuses;
+//   * the final component must not itself be a symlink;
+//   * before any deletion, an existing target must look like a
+//     build output directory: no .git entry, and nothing in it but
+//     known release artifact names — anything else refuses.
+const KNOWN_RELEASE_ARTIFACTS = new Set([
+  'agentonly-runtime.tar.gz',
+  'agentonly-mcp.mjs',
+  'release.json',
+  'release.json.sig',
+  'SHA256SUMS',
+  '.runtime-stage',
+]);
 {
-  const resolvedDist = resolve(dist);
-  const resolvedRoot = resolve(root);
-  if (resolvedDist !== resolvedRoot && !resolvedDist.startsWith(resolvedRoot + sep)) {
+  const canonicalDist = canonicalPath(dist);
+  const canonicalDistBase = join(canonicalRoot, 'dist');
+  if (canonicalDist !== canonicalDistBase && !canonicalDist.startsWith(canonicalDistBase + sep)) {
     throw new Error(
-      `refusing to build: AONLY_DIST (${resolvedDist}) must resolve inside the repository root (${resolvedRoot}) — the build recursively deletes its output directory first, and an arbitrary path is never a safe deletion target`,
+      `refusing to build: AONLY_DIST (${dist}) must be the repository's dist directory or a directory under it — its canonical path (${canonicalDist}) escapes ${canonicalDistBase}. The build recursively deletes its output directory first; the repository root itself and any path outside dist/ are never safe deletion targets.`,
     );
+  }
+  let lst = null;
+  try { lst = lstatSync(dist); } catch { /* nonexistent: a fresh output directory */ }
+  if (lst?.isSymbolicLink()) {
+    throw new Error(
+      `refusing to build: AONLY_DIST (${dist}) is itself a symlink — the build never deletes through a link. Remove the link and build again.`,
+    );
+  }
+  if (lst && !lst.isDirectory()) {
+    throw new Error(`refusing to build: AONLY_DIST (${dist}) exists and is not a directory`);
+  }
+  if (lst) {
+    const entries = readdirSync(dist);
+    if (entries.includes('.git')) {
+      throw new Error(
+        `refusing to build: AONLY_DIST (${dist}) contains a .git entry — it looks like a repository checkout, not a build output directory, and the build would delete it.`,
+      );
+    }
+    const foreign = entries.filter((e) => !KNOWN_RELEASE_ARTIFACTS.has(e));
+    if (foreign.length) {
+      throw new Error(
+        `refusing to build: AONLY_DIST (${dist}) contains entries that are not known release artifacts (${foreign.join(', ')}) — the build recursively deletes its output directory first, and this directory does not look like a previous build's output. Move its contents elsewhere if they matter.`,
+      );
+    }
   }
 }
 rmSync(dist, { recursive: true, force: true });
