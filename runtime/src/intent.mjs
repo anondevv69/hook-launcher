@@ -272,6 +272,12 @@ export function engineHolderPda(mint, key) {
 export function distributorClaimPda(mint, holder) {
   return pdaFor([Buffer.from('claim'), mint, holder], PLATFORM_PROGRAMS.distributor);
 }
+// The HouseSwap pool PDA (gateway doors.mjs housePoolPda, mirrored):
+// seeds ['pool', mint] under the house program. The pool's token and
+// quote vaults are its derived ATAs — see classifyHouseSwap.
+export function housePoolPda(mint) {
+  return pdaFor([Buffer.from('pool'), mint], PLATFORM_PROGRAMS.house);
+}
 
 // The account sets the trade is allowed to touch, derived from the card
 // context + canonical record:
@@ -359,6 +365,19 @@ function normalizeInstructions(compiled, keys, dataOf) {
         from: accounts[0],
         to: accounts[1],
         lamports: Buffer.from(data).readBigUInt64LE(4).toString(),
+      };
+    }
+    if (programId === PLATFORM_PROGRAMS.house && data && data.length >= 18 && data[0] === 1) {
+      // HouseSwap swap terms (repair round 4, P1-2): data is exactly
+      // [1][dir u8][amount_in u64 LE][min_out u64 LE] — the TaxSwap
+      // encoding the house program and the gateway's doors.mjs builder
+      // share byte-for-byte. Parsed here so classification and the
+      // terms cross-check in validateIntent bind the exact values.
+      const buf = Buffer.from(data);
+      out.swapTerms = {
+        direction: buf[1],
+        amountInRaw: buf.readBigUInt64LE(2).toString(),
+        minimumOutRaw: buf.readBigUInt64LE(10).toString(),
       };
     }
     if ((programId === TOKEN_PROGRAM || programId === TOKEN_2022_PROGRAM) && data && data.length >= 9) {
@@ -551,6 +570,45 @@ function classifyPlatformInstruction(ix, ctx) {
       shape(`settle carries a fixed 9-account prefix before its hook-extra tail; this one carries ${a.length} accounts`);
     }
     if (a[0] !== wallet) shape('settle payer is not the wallet');
+    // Repair round 4, P1-1: the payout recipient is pinned to the
+    // production forms. The distributor program itself enforces
+    // on-chain that the recipient is a token account OF THE NAMED
+    // HOLDER for the card mint (its BadTokenAccount check), so a
+    // payout can only ever reach the holder's own accounts; the
+    // runtime pin exists to keep every payout inside the modeled
+    // accounts:
+    //   * the WALLET's own settle (holder == wallet) must pay the
+    //     wallet's DERIVED token account for the card mint — the
+    //     exact account the gateway's Trade Kit settles into
+    //     (tradekit settleIx builds c.ata(holder)) and the account
+    //     the send-time payout decomposition reads. No exceptions:
+    //     the decomposition is only sound for this account.
+    //   * a COUNTERPARTY settle (the crank the gateway bundles for
+    //     the swap's other side) may pay that holder's derived token
+    //     account, a canonical pool token vault (records that name
+    //     baseVault/tokenVault include it in the pool set), or the
+    //     account the transaction's own validated venue swap names
+    //     as its token vault — the curve pool's base vault is a
+    //     venue-program account the published record does not name,
+    //     and the swap that trades against it is validated
+    //     independently (discriminator + canonical pool).
+    // A settle paying any other account — above all a stranger's —
+    // is not a production shape and refuses here, before modeling.
+    {
+      let holderAta = null;
+      try {
+        holderAta = associatedTokenAddress(new PublicKey(mint), new PublicKey(a[1]), TOKEN_2022_PROGRAM).toBase58();
+      } catch { holderAta = null; }
+      if (a[1] === wallet) {
+        if (a[2] !== holderAta) {
+          shape('the wallet\u2019s own settle pays an account that is not the wallet\u2019s derived token account for the card mint');
+        }
+      } else if (a[2] !== holderAta
+        && !sets.poolTokenAccounts.includes(a[2])
+        && !(ctx.venueAccounts && ctx.venueAccounts.has(a[2]))) {
+        shape('a counterparty settle pays an account that is neither the holder\u2019s derived token account, nor a canonical pool token vault, nor an account the venue swap names');
+      }
+    }
     if (a[3] !== mint) shape('settle does not name the card mint');
     if (P.distState && a[4] !== P.distState) shape('settle state account is not the canonical record\u2019s distributor state');
     if (P.distVault && a[5] !== P.distVault) shape('settle vault account is not the canonical record\u2019s distributor vault');
@@ -610,6 +668,65 @@ function classifyPlatformInstruction(ix, ctx) {
   throw unclassified(ix, `engine instruction tag ${ix.tag} is not part of a trade — the trade vocabulary is sync (4), crankCp (5), syncGate (7), crankDbc (8); tag 9 (RefreshExtraAccountMetas) is an operator repair, never bundled into a trade`);
 }
 
+// HouseSwap exact-format validation (repair round 4, P1-2).
+//
+// Round 3 validated the DBC swap's discriminator but admitted ANY
+// instruction on the house program as the swap. The house program is
+// a full venue program (pool admin, escrow, fee operations) — program
+// identity alone admits data-only state mutations and non-swap
+// operations riding a trade. The production swap has an exact format,
+// shared byte-for-byte between the house program and the gateway's
+// doors.mjs builder (contract §2.2/§2.3):
+//
+//   data: exactly 18 bytes — [1][dir][amount_in u64][min_out u64],
+//         dir 0 = buy, 1 = sell, matching the card side;
+//   keys: the fixed 10-account prefix
+//         [pool, token_mint, quote_mint(WSOL), token_vault, quote_vault,
+//          user_token, user_quote, user, Token-2022, legacy Token]
+//         where pool is the derived HouseSwap pool PDA for the mint,
+//         the vaults are the pool's derived ATAs, and the user accounts
+//         are the wallet's derived ATAs — followed by the transfer-hook
+//         tail and venue extras, whose effects full-effect accounting
+//         bounds at send time.
+//
+// Any other instruction on the house program — wrong tag, wrong data
+// size, wrong direction, a lookalike account in any fixed position —
+// refuses. The amount/min-out terms are cross-checked against the
+// card in validateIntent (the classifier does not see the quote).
+function classifyHouseSwap(ix, ctx) {
+  const { wallet, mint, side, sets } = ctx;
+  const a = ix.accounts;
+  const shape = (why) => { throw unclassified(ix, why); };
+  if (ix.tag !== 1 || ix.dataLength !== 18 || !ix.swapTerms) {
+    shape('the only HouseSwap instruction in a trade is the swap: data [1, dir, amount_in u64, min_out u64] — exactly 18 bytes');
+  }
+  const dir = ix.swapTerms.direction;
+  if (dir !== 0 && dir !== 1) shape(`house swap direction must be 0 (buy) or 1 (sell), got ${dir}`);
+  if ((side === 'buy' && dir !== 0) || (side === 'sell' && dir !== 1)) {
+    shape(`house swap direction ${dir} contradicts the card side '${side}'`);
+  }
+  if (a.length < 10) {
+    shape(`house swap carries a fixed 10-account prefix before its hook tail; this one carries ${a.length} accounts`);
+  }
+  const pool = housePoolPda(mint);
+  if (a[0] !== pool) shape('house swap pool is not the derived HouseSwap pool PDA for this mint');
+  if (sets.pools.length && !sets.pools.includes(a[0])) {
+    shape('house swap pool is not a pool the canonical record names for this mint');
+  }
+  if (a[1] !== mint) shape('house swap does not name the card mint as its token mint');
+  if (a[2] !== WSOL_MINT) shape('house swap quote mint is not wrapped SOL');
+  const ata = (m, owner, tp) => associatedTokenAddress(new PublicKey(m), new PublicKey(owner), tp).toBase58();
+  if (a[3] !== ata(mint, pool, TOKEN_2022_PROGRAM)) shape('house swap token vault is not the pool\u2019s derived token account for the card mint');
+  if (a[4] !== ata(WSOL_MINT, pool, TOKEN_PROGRAM)) shape('house swap quote vault is not the pool\u2019s derived wrapped-SOL account');
+  if (a[5] !== ata(mint, wallet, TOKEN_2022_PROGRAM)) shape('house swap user token account is not the wallet\u2019s derived token account for the card mint');
+  if (a[6] !== sets.wsolAta) shape('house swap user quote account is not the wallet\u2019s derived wrapped-SOL account');
+  if (a[7] !== wallet) shape('house swap user is not the wallet');
+  if (a[8] !== TOKEN_2022_PROGRAM || a[9] !== TOKEN_PROGRAM) {
+    shape('house swap must close its fixed prefix with the Token-2022 and legacy Token programs, in that order');
+  }
+  return 'venue-swap';
+}
+
 // ctx: { wallet, mint, side, venueProgram, sets (tradeAccountSets) }
 function classifyInstruction(ix, ctx) {
   const { wallet, mint, side, venueProgram, sets } = ctx;
@@ -626,18 +743,29 @@ function classifyInstruction(ix, ctx) {
     return classifyPlatformInstruction(ix, ctx);
   }
   if (pid === PLATFORM_PROGRAMS.dbc || pid === PLATFORM_PROGRAMS.house) {
-    if (!venueProgram || pid === venueProgram) {
-      // Discriminator validation (repair round 3, P1-1): a venue
-      // instruction must BE the swap, not just run on the venue
-      // program. The DBC swap carries the 8-byte discriminator the
-      // production gateway emits; anything else on the program —
-      // including data-only payloads — refuses.
-      if (pid === PLATFORM_PROGRAMS.dbc && ix.dataPrefix !== DBC_SWAP_DISCRIMINATOR) {
+    // Repair round 4, P1-4: a venue instruction is admitted ONLY for
+    // the exact venue bound to this trade. Rounds 1–3 admitted either
+    // venue program whenever no venue was bound (venueProgram null),
+    // so an unknown or missing venue silently unbound the swap check.
+    if (!venueProgram) {
+      throw unclassified(ix, 'instruction runs on a venue program, but no known venue is bound for this trade — a venue swap is admitted only for the exact quoted venue');
+    }
+    if (pid !== venueProgram) {
+      throw unclassified(ix, 'instruction runs on a venue program that is not the quoted venue');
+    }
+    // Discriminator validation (repair round 3, P1-1): a venue
+    // instruction must BE the swap, not just run on the venue
+    // program. The DBC swap carries the 8-byte discriminator the
+    // production gateway emits; anything else on the program —
+    // including data-only payloads — refuses.
+    if (pid === PLATFORM_PROGRAMS.dbc) {
+      if (ix.dataPrefix !== DBC_SWAP_DISCRIMINATOR) {
         throw unclassified(ix, 'venue instruction does not carry the DBC swap discriminator — it is not the swap the gateway builds');
       }
       return 'venue-swap';
     }
-    throw unclassified(ix, 'instruction runs on a venue program that is not the quoted venue');
+    // HouseSwap: the exact swap format or nothing (repair round 4, P1-2).
+    return classifyHouseSwap(ix, ctx);
   }
   if (pid === ATA_PROGRAM) {
     // CreateAssociatedTokenAccount (incl. CreateIdempotent) accounts:
@@ -661,15 +789,25 @@ function classifyInstruction(ix, ctx) {
   if (pid === SYSTEM_PROGRAM) {
     if (ix.tag === 2 && ix.transfer) {
       const { from, to } = ix.transfer;
-      if (side === 'buy' && from === wallet && sets.pools.includes(to)) return 'trade-transfer';
-      if (side === 'sell' && sets.pools.includes(from) && to === wallet) return 'trade-transfer';
+      // Repair round 4, P0: direct wallet\u2194pool SOL transfers are
+      // REFUSED, outright. Rounds 1\u20133 admitted them as 'trade-transfer'
+      // (buy: wallet\u2192pool; sell: pool\u2192wallet), and the send-time pool
+      // check only bounded the pool's gain by the trade input \u2014 so an
+      // appended direct transfer inside the fee ceiling passed as if it
+      // were part of the trade. But the production venue shapes are
+      // WSOL-based (wrap \u2192 venue swap \u2192 close): neither the curve/DBC
+      // build nor the HouseSwap build ever contains a direct
+      // wallet\u2194pool System transfer, and no other venue this runtime
+      // supports has an exact format that requires one. There is
+      // therefore nothing legitimate to gate the admission to \u2014 the
+      // classification is deleted, not narrowed.
       // The wrap leg: the wallet funds its OWN derived wrapped-SOL
-      // account (either side — a sell build may wrap around the swap
+      // account (either side \u2014 a sell build may wrap around the swap
       // too). No other System destination is admitted.
       if (from === wallet && to === sets.wsolAta) return 'wsol-wrap';
-      throw unclassified(ix, `a System transfer ${from} \u2192 ${to} is not the trade\u2019s wallet\u2194pool leg or the wallet\u2019s own wrapped-SOL wrap`);
+      throw unclassified(ix, `a System transfer ${from} \u2192 ${to} is not the wallet\u2019s own wrapped-SOL wrap \u2014 direct wallet\u2194pool SOL transfers are not part of any supported venue\u2019s trade shape (the venues move SOL through the wallet\u2019s wrapped-SOL account)`);
     }
-    throw unclassified(ix, 'only a wallet\u2194pool SOL transfer or the wallet\u2019s own wrapped-SOL wrap belongs to a trade');
+    throw unclassified(ix, 'only the wallet\u2019s own wrapped-SOL wrap belongs to a trade');
   }
   if (pid === TOKEN_PROGRAM || pid === TOKEN_2022_PROGRAM) {
     // SyncNative (tag 17): syncs a native (wrapped-SOL) account's
@@ -708,10 +846,25 @@ function classifyInstruction(ix, ctx) {
 
 // Validates a derived intent against the trade context. ctx:
 // { wallet, mint, side, venue ('curve'|'house'|null), tokenJson (canonical
-// token record — its `pool` is checked when the venue is the curve) }.
+// token record — its `pool` is checked when the venue is the curve),
+// amountInRaw?, minimumAmountOutRaw? (the approved terms; required for
+// the house venue, whose swap carries its terms in its data) }.
 // Returns { venueProgram } on success; throws IntentError otherwise.
 export function validateIntent(intent, ctx) {
   const { wallet, mint, venue } = ctx;
+
+  // Repair round 4, P1-4: an unknown venue string refuses here, in
+  // the shared validator. Rounds 1–3 mapped an unrecognized venue to
+  // a null venue program, which silently disabled the venue binding
+  // (either venue program's swap classified). The known set is
+  // exactly the keys of VENUE_PROGRAM_BY_VENUE.
+  if (venue != null && !Object.hasOwn(VENUE_PROGRAM_BY_VENUE, venue)) {
+    throw new IntentError(
+      'VENUE_UNKNOWN',
+      `venue '${venue}' is not a venue this runtime knows (known: ${Object.keys(VENUE_PROGRAM_BY_VENUE).join(', ')}) — refusing: an unrecognized venue cannot bind the build to a route`,
+      { venue },
+    );
+  }
 
   if (intent.feePayer !== wallet) {
     throw new IntentError(
@@ -796,8 +949,17 @@ export function validateIntent(intent, ctx) {
       { venue, mint },
     );
   }
+  // Accounts the transaction's venue swap(s) name — the counterparty
+  // settle's recipient pin (classifyPlatformInstruction) accepts the
+  // pool token vault the swap itself trades against.
+  const venueAccounts = new Set();
   for (const ix of intent.instructions) {
-    classifyInstruction(ix, { wallet, mint, side: ctx.side, venueProgram, sets });
+    if (ix.programId === PLATFORM_PROGRAMS.dbc || ix.programId === PLATFORM_PROGRAMS.house) {
+      for (const a of ix.accounts) venueAccounts.add(a);
+    }
+  }
+  for (const ix of intent.instructions) {
+    classifyInstruction(ix, { wallet, mint, side: ctx.side, venueProgram, sets, venueAccounts });
   }
 
   if (venue) {
@@ -813,6 +975,42 @@ export function validateIntent(intent, ctx) {
         'INTENT_POOL_MISMATCH',
         `decoded transaction does not touch the canonical curve pool (${sets.pools.join(', ')}) from the token record. Refusing.`,
         { pool: sets.pools[0] },
+      );
+    }
+  }
+
+  // HouseSwap terms cross-check (repair round 4, P1-2): the swap's
+  // data carries the trade terms themselves (amount in, minimum out),
+  // so the bytes must agree with the approved terms — a house swap
+  // for a different amount, or with an on-chain minimum-out floor
+  // below the card's approved minimum, is not the approved trade.
+  if (venue === 'house') {
+    const swap = intent.instructions.find((ix) => ix.programId === PLATFORM_PROGRAMS.house);
+    if (!swap?.swapTerms) {
+      throw new IntentError(
+        'VENUE_TERMS_MISMATCH',
+        'the house swap\u2019s terms could not be read from its data — refusing',
+      );
+    }
+    if (ctx.amountInRaw == null || ctx.minimumAmountOutRaw == null) {
+      throw new IntentError(
+        'VENUE_TERMS_UNVERIFIED',
+        'house venue validation requires the approved amount/minimum-out terms to cross-check the swap\u2019s embedded terms against — refusing without them',
+        { venue },
+      );
+    }
+    if (swap.swapTerms.amountInRaw !== String(ctx.amountInRaw)) {
+      throw new IntentError(
+        'VENUE_TERMS_MISMATCH',
+        `the house swap\u2019s embedded amount_in is ${swap.swapTerms.amountInRaw} raw units but the approved amount is ${ctx.amountInRaw} — the bytes are not the approved trade. Refusing.`,
+        { swapAmountInRaw: swap.swapTerms.amountInRaw, amountInRaw: String(ctx.amountInRaw) },
+      );
+    }
+    if (BigInt(swap.swapTerms.minimumOutRaw) < BigInt(ctx.minimumAmountOutRaw)) {
+      throw new IntentError(
+        'VENUE_TERMS_MISMATCH',
+        `the house swap\u2019s embedded min_out is ${swap.swapTerms.minimumOutRaw}, below the approved minimum out of ${ctx.minimumAmountOutRaw} — the on-chain floor undercuts the approved floor. Refusing.`,
+        { swapMinimumOutRaw: swap.swapTerms.minimumOutRaw, minimumAmountOutRaw: String(ctx.minimumAmountOutRaw) },
       );
     }
   }
