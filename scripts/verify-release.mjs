@@ -21,7 +21,7 @@
 // Usage: node scripts/verify-release.mjs [baseUrl] [--allow-commit-drift] [--skip-rebuild]
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -96,11 +96,17 @@ if (failures.length) { console.log('\nAborted: artifact mismatch.'); process.exi
 // --- 4: rebuild from the checkout and compare --------------------------------
 const repoRoot = join(scriptDir, '..');
 if (!SKIP_REBUILD && existsSync(join(repoRoot, 'runtime', 'package.json')) && existsSync(join(repoRoot, 'mcp', 'agentonly-mcp.mjs'))) {
-  const outDir = mkdtempSync(join(tmpdir(), 'aonly-rebuild-'));
+  // The rebuild's output directory lives under the repo's dist/
+  // (repair round 4, P1-7a): build-release.mjs now refuses any
+  // AONLY_DIST outside the repository root, because it recursively
+  // deletes the directory it is given. dist/ is the build's own
+  // exempt-from-clean-tree directory, so this stays legal mid-verify.
+  const outDir = join(repoRoot, 'dist', `.verify-rebuild-${process.pid}`);
   execFileSync('node', [join(scriptDir, 'build-release.mjs')], {
     cwd: repoRoot, env: { ...process.env, AONLY_DIST: outDir }, stdio: 'pipe',
   });
   const rebuilt = JSON.parse(readFileSync(join(outDir, 'release.json'), 'utf8'));
+  rmSync(outDir, { recursive: true, force: true });
   for (const a of manifest.artifacts) {
     const r = rebuilt.artifacts.find((x) => x.file === a.file);
     if (r && r.sha256 === a.sha256) ok(`rebuild from checkout reproduces ${a.file} exactly`);
