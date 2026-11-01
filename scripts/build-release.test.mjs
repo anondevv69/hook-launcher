@@ -19,9 +19,8 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -51,8 +50,58 @@ function buildTo(outDir) {
   return sha256hex(readFileSync(join(outDir, 'agentonly-runtime.tar.gz')));
 }
 
+// The scratch tree lives under the repo's dist/ (repair round 4,
+// P1-7a): build-release.mjs refuses any AONLY_DIST outside the
+// repository root, since it recursively deletes the directory it is
+// given. dist/ is exempt from the build's clean-tree gate.
+mkdirSync(join(ROOT, 'dist'), { recursive: true });
+const work = mkdtempSync(join(ROOT, 'dist', 'build-test-'));
+
+// ---------------------------------------------------------------------------
+// Repair round 4, P1-3 regression: an ignored secret-named file planted
+// under runtime/src must NOT enter the tarball (the build stages from
+// the git-tracked file manifest), and every tracked runtime file MUST
+// be present. The planted name matches runtime/.gitignore's
+// *.keypair.json pattern, so it is invisible to the clean-tree gate —
+// exactly the leak the tracked-file build closes.
+// ---------------------------------------------------------------------------
+{
+  const planted = join(RUNTIME, 'src', 'planted-secret.keypair.json');
+  writeFileSync(planted, 'planted by build-release.test — must never ship\n');
+  try {
+    buildTo(join(work, 'out-planted'));
+    const listing = execFileSync('tar', ['-tzf', join(work, 'out-planted', 'agentonly-runtime.tar.gz')]).toString();
+    if (listing.includes('planted-secret')) {
+      fail('an ignored planted file under runtime/src entered the release tarball — the build is copying the working tree, not the tracked file set');
+    } else {
+      console.log('ok: planted ignored file under runtime/src is absent from the tarball');
+    }
+    const tracked = execFileSync('git', ['ls-files', '--', 'runtime'], { cwd: ROOT }).toString()
+      .split('\n').filter(Boolean).map((p) => p.slice('runtime/'.length));
+    const entries = listing.split('\n').filter(Boolean);
+    for (const rel of tracked) {
+      if (!entries.includes(rel)) fail(`git-tracked runtime file ${rel} is missing from the tarball`);
+    }
+    console.log(`ok: all ${tracked.length} git-tracked runtime files are present in the tarball`);
+    // P1-7a: an AONLY_DIST outside the repo root refuses before any
+    // deletion — the outside path must not be created or emptied.
+    const evilDist = '/tmp/aonly-evil-dist-round4-test';
+    rmSync(evilDist, { recursive: true, force: true });
+    let refused = false;
+    try {
+      execFileSync(process.execPath, [BUILD], {
+        cwd: ROOT, env: { ...process.env, AONLY_DIST: evilDist }, stdio: 'pipe',
+      });
+    } catch { refused = true; }
+    if (!refused) fail('build accepted an AONLY_DIST outside the repository root');
+    else if (existsSync(evilDist)) fail('build touched the outside AONLY_DIST path despite refusing');
+    else console.log('ok: AONLY_DIST outside the repository root refuses before any deletion');
+  } finally {
+    rmSync(planted, { force: true });
+  }
+}
+
 const original = walk(RUNTIME);
-const work = mkdtempSync(join(tmpdir(), 'build-release-test-'));
 try {
   const hashBefore = buildTo(join(work, 'out-before'));
 
