@@ -1,4 +1,4 @@
-// agentonly-runtime acceptance fixtures (31).
+// agentonly-runtime acceptance fixtures (41).
 //
 // Repair round 2 (PR #5 review) added: 16/17 malicious bundled builds
 // (extra SOL transfer / unrelated-token transfer → instruction
@@ -13,6 +13,19 @@
 // binding (P1-2), 29 sidecar symlink refusal (P1-3), 30 empty
 // post-simulation token data (P1-4), 31 confirmed on-chain error
 // reported as failure (P1-5).
+//
+// Repair round 4 added: 32 direct wallet↔pool SOL transfers refused
+// (P0), 33 bundled-settle sell passes with the payout modeled
+// (P1-1), 34 settlement payout over the modeled bound refuses
+// (P1-1), 35 settle paying a non-derived / non-canonical account
+// refuses (P1-1), 36 external-signer allowlist: unenrolled refuses,
+// enrolled-but-changed refuses, enrolled works (P1-5), 37 unknown /
+// missing / disagreed venue refuses at prepare (P1-4), 38 prepare
+// --out onto a planted symlink refuses (P1-7b), 39 malformed
+// confirmation is a failure, never a receipt (P1-6), 40 displayed
+// fees / price impact are bound into the approval token (P1-8),
+// 41 HouseSwap exact format: discriminator, direction, data size,
+// canonical layout (P1-2).
 //
 // Repair round 2.1 added: 23 the REAL gateway build shape — fee
 // distributor settles, WSOL ATA create, wrap transfer, SyncNative,
@@ -69,8 +82,10 @@ import {
   PLATFORM_PROGRAMS,
   WSOL_MINT,
   associatedTokenAddress,
+  deriveIntent,
   distributorClaimPda,
   fingerprintOf,
+  housePoolPda,
   parseStrictDecimal,
   policyFingerprintOf,
   prepareTrade,
@@ -665,7 +680,14 @@ function craftCard(wallet, txB64, lvbh) {
   const { blockhash, lvbh } = await liveBlockhash();
   const state = makeTradeState(kp, blockhash, lvbh);
   const stub = await startStub(state);
-  const env = { AGENTONLY_GATEWAY_BASE: stub.url, AGENTONLY_RPC_URL: stub.url };
+  // Repair round 4, P1-5: the external signer must be ENROLLED in the
+  // user-owned allowlist before any send runs it. The fixture enrolls
+  // this process's node binary (the executable the sends name) into a
+  // fixture-local allowlist.
+  const env = {
+    AGENTONLY_GATEWAY_BASE: stub.url, AGENTONLY_RPC_URL: stub.url,
+    AGENTONLY_SIGNER_ALLOWLIST: join(dir, 'signers.json'),
+  };
   const cardPath = join(dir, 'approval-card.json');
 
   // The signer scripts run from the temp dir, outside the project's
@@ -708,6 +730,8 @@ process.stdin.on('end', () => {
   const card = existsSync(cardPath) ? JSON.parse(readFileSync(cardPath, 'utf8')) : null;
   let ok = false; const lines = [`external prepare exit=${prep.code}, card written=${!!card}`];
   if (card) {
+    const enroll = await runCli(['signer', 'enroll', '--path', process.execPath], { cwd: dir, env });
+    lines.push(`signer enroll exit=${enroll.code} (allowlist: fixture-local)`);
     // Repair round 2 interface: --external-signer is a plain executable
     // PATH (here: this process's own node binary); the script and its
     // keyfile arrive as structured --external-signer-arg argv. No shell.
@@ -729,14 +753,15 @@ process.stdin.on('end', () => {
       { cwd: dir, env },
     );
     lines.push(`shell-string signer exit=${shellForm.code}, code=${shellForm.out.includes('EXTERNAL_SIGNER_INVALID') ? 'EXTERNAL_SIGNER_INVALID' : 'MISSING'}`);
-    ok = good.code === 0 && good.out.includes('DRY RUN')
+    ok = enroll.code === 0
+      && good.code === 0 && good.out.includes('DRY RUN')
       && evil.code !== 0 && evil.out.includes('EXTERNAL_SIGNER_MISMATCH')
       && shellForm.code !== 0 && shellForm.out.includes('EXTERNAL_SIGNER_INVALID');
   } else {
     lines.push(`prepare output: ${prep.out.trim().split('\n')[0]}`);
   }
   stub.server.close();
-  report(13, 'external signer — shell-free executable + structured args; altered message and shell-string refused', ok, lines);
+  report(13, 'external signer — enrolled executable, shell-free + structured args; altered message and shell-string refused', ok, lines);
 }
 
 // ---------------------------------------------------------------------------
@@ -901,12 +926,24 @@ function buyStateFns({ wallet, ata, pool, extraPre = {}, extraPost = {} }) {
   };
   return { preFor, postFor };
 }
-function makeDoubleConn({ preFor, postFor, blockHeight, altAccount = null }) {
+function makeDoubleConn({ preFor, postFor, blockHeight, altAccount = null, vaultBalance = 934n }) {
   let rawSends = 0;
   const conn = {
     rpcEndpoint: 'stub://double',
     getBalance: async () => 100_000_000,
     getBlockHeight: async () => blockHeight,
+    // The settlement model (repair round 4, P1-1) reads the
+    // distributor vault through getAccountInfo at prepare time: a
+    // token account for AGTR owned by the distributor state, holding
+    // vaultBalance raw units (934 = the live vault balance when the
+    // model was designed; fixtures override it as needed).
+    getAccountInfo: async (pk) => {
+      const addr = pk.toBase58();
+      if (addr === DIST_VAULT) {
+        return acctState(1_539_240, stdTokenBlob(AGTR, DIST_STATE, vaultBalance), new PublicKey(TOKEN_2022_PROGRAM));
+      }
+      return preFor(addr);
+    },
     getMultipleAccountsInfo: async (keys) => keys.map((k) => preFor(k.toBase58())),
     simulateTransaction: async (txArg, cfg) => ({
       value: { err: null, unitsConsumed: 150, logs: [], accounts: (cfg?.accounts?.addresses ?? []).map(postFor) },
@@ -936,7 +973,15 @@ function stubBuild(txB64, blockhash, lvbh) {
     simulation: { status: 'passed', layer: 'none', unitsConsumed: 150, provisional: true, note: 'stub' },
   };
 }
-const TOKEN_JSON_STUB = { mint: AGTR, symbol: 'AGTR', decimals: 6, addresses: { pool: AGTR_POOL } };
+// AGTR's distributor addresses, from its live canonical record — the
+// settlement model (repair round 4, P1-1) authenticates the vault
+// against exactly these.
+const DIST_STATE = 'cexMThLhJJgXnrxMY8ua8F1gTbLfGnoyGhwUVogbKkS';
+const DIST_VAULT = '6LeucGfr2GBpCACQEJbCTjsAUnt2uwFLjHSBRKmjc5FA';
+const TOKEN_JSON_STUB = {
+  mint: AGTR, symbol: 'AGTR', decimals: 6,
+  addresses: { pool: AGTR_POOL, distributor: { state: DIST_STATE, vault: DIST_VAULT } },
+};
 
 // ---------------------------------------------------------------------------
 // Fixture 18 — simulation moves value to an unexpected third account
@@ -1714,6 +1759,576 @@ function buildRealShapeTx({ kp, mint, pool, blockhash, lvbh, wrapDestination = n
     lines.push(`sendRawTransaction calls=${rawSends()} (must be 1 — the transaction WAS broadcast; its failure is what is reported)`);
   }
   report(31, 'confirmed on-chain error — reported as failure, never a receipt (P1-5)', ok, lines);
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures 32–41 — repair round 4 (PR #5, Codex round-3 review).
+// 32 direct wallet↔pool SOL transfers refused (P0), 33 bundled-settle
+// sell passes with the payout modeled (P1-1), 34 payout over the
+// modeled bound refuses (P1-1), 35 settle paying a non-derived or
+// non-canonical account refuses (P1-1), 36 external-signer allowlist
+// (P1-5), 37 venue agreement at prepare (P1-4), 38 prepare --out
+// symlink refusal (P1-7b), 39 malformed confirmation is a failure
+// (P1-6), 40 displayed fees / price impact bound into the approval
+// token (P1-8), 41 HouseSwap exact format (P1-2).
+// ---------------------------------------------------------------------------
+
+// The production settle shape (see fixture 23): data [3], the fixed
+// 9-account prefix, plus a hook-extra tail.
+function settleIx({ payer, holder, mint }) {
+  const holderAta = associatedTokenAddress(new PublicKey(mint), holder, TOKEN_2022_PROGRAM);
+  return new TransactionInstruction({
+    programId: new PublicKey(DIST_PROGRAM),
+    keys: [
+      { pubkey: payer, isSigner: true, isWritable: true },
+      { pubkey: holder, isSigner: false, isWritable: false },
+      { pubkey: holderAta, isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(mint), isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(DIST_STATE), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(DIST_VAULT), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(distributorClaimPda(mint, holder.toBase58())), isSigner: false, isWritable: true },
+      { pubkey: new PublicKey(TOKEN_2022_PROGRAM), isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(mint), isSigner: false, isWritable: false },
+      { pubkey: holderAta, isSigner: false, isWritable: true },
+    ],
+    data: Buffer.from([3]),
+  });
+}
+function sellGwFetch(txB64, blockhash, lvbh) {
+  const sellBuild = {
+    status: 'ready_for_signature', symbol: 'AGTR', venue: 'curve',
+    amount_in: '100', amount_out_expected: '9000000', minimum_amount_out: '8000000', price_impact_bps: 0,
+    bundled: ['distributor-settle'], transaction_base64: txB64, blockhash, last_valid_block_height: lvbh,
+    simulation: { status: 'passed', layer: 'none', unitsConsumed: 150, provisional: true, note: 'stub' },
+  };
+  return async (url) => {
+    const u = String(url);
+    const mk = (obj) => ({ ok: true, status: 200, json: async () => obj });
+    if (u.includes('/v1/trade/eligibility')) return mk({ ok: true, status: 'eligible', reasons: [] });
+    if (u.includes('/v1/trade/quote')) return mk({ ok: true, venue: 'curve', amountIn: '100', amountOut: '9000000', minimumAmountOut: '8000000', fees: { total: '0' }, priceImpactBps: 0, symbol: 'AGTR' });
+    if (u.includes('/v1/trade/build')) return mk({ ok: true, ...sellBuild });
+    throw new Error(`sell gwFetch: unexpected fetch ${u}`);
+  };
+}
+
+// Fixture 32 — P0: a direct wallet→pool (buy) or pool→wallet (sell)
+// System transfer appended to a legitimate build refuses at prepare.
+// The transfer (5,000 lamports) sits far inside the fee ceiling —
+// exactly the shape the old 'trade-transfer' classification plus the
+// pool-gain bound used to wave through.
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const lines = [];
+  let ok = true;
+  {
+    const { tx } = buildRealShapeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+    tx.add(SystemProgram.transfer({ fromPubkey: kp.publicKey, toPubkey: new PublicKey(AGTR_POOL), lamports: 5_000 }));
+    const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+    const ata = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+    const { preFor, postFor } = buyStateFns({ wallet, ata, pool: AGTR_POOL });
+    const { conn } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+    let code = 'NO-THROW';
+    try {
+      await prepareTrade({ wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own', fetchImpl: makeGwFetch(stubBuild(txB64, blockhash, lvbh)), connection: conn, tokenJson: TOKEN_JSON_STUB });
+    } catch (e) { code = e.code ?? 'ERR'; }
+    const good = code === 'UNCLASSIFIED_INSTRUCTION';
+    ok = ok && good;
+    lines.push(`buy + appended wallet→pool transfer (5,000 lamports, inside the fee ceiling): refused at prepare=${good} code=${code}`);
+  }
+  {
+    const tx = buildTradeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+    tx.add(SystemProgram.transfer({ fromPubkey: new PublicKey(AGTR_POOL), toPubkey: kp.publicKey, lamports: 5_000 }));
+    const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+    const ata = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+    const { preFor, postFor } = buyStateFns({ wallet, ata, pool: AGTR_POOL });
+    const { conn } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+    let code = 'NO-THROW';
+    try {
+      await prepareTrade({ wallet, mint: AGTR, side: 'sell', amount: '0.0001', signerType: 'own', fetchImpl: sellGwFetch(txB64, blockhash, lvbh), connection: conn, tokenJson: TOKEN_JSON_STUB });
+    } catch (e) { code = e.code ?? 'ERR'; }
+    // A pool-sourced System transfer makes the POOL a required
+    // signer, so the signer-set check fires before classification —
+    // either refusal is the P0 outcome (the classification itself no
+    // longer admits the shape either; the buy direction above proves
+    // that path directly).
+    const good = code === 'UNCLASSIFIED_INSTRUCTION' || code === 'INTENT_SIGNERS_MISMATCH';
+    ok = ok && good;
+    lines.push(`sell + appended pool→wallet transfer: refused at prepare=${good} code=${code} (the pool becomes a required signer, so the signer-set check fires first; classification no longer admits the shape either)`);
+  }
+  report(32, 'direct wallet↔pool SOL transfers — refused at prepare, both directions (P0)', ok, lines);
+}
+
+// Fixtures 33 + 34 — P1-1: the bundled-settle sell. The transaction
+// carries the wallet's own settle AND the counterparty's settle (the
+// production bundle). Simulated story: the wallet sells 100 raw; its
+// own settle pays 250 into the same ATA (net ATA delta +150); the
+// counterparty's settle pays 400 into the counterparty's ATA; the
+// distributor vault (balance 1,000 at prepare) pays out 650 total.
+function buildSettleSellTx({ kp, cp, blockhash, lvbh }) {
+  const wallet = kp.publicKey;
+  const mintPk = new PublicKey(AGTR);
+  const ata = associatedTokenAddress(mintPk, wallet, TOKEN_2022_PROGRAM);
+  const tx = new Transaction({ feePayer: wallet, blockhash, lastValidBlockHeight: lvbh });
+  tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }));
+  tx.add(settleIx({ payer: wallet, holder: wallet, mint: AGTR }));
+  tx.add(settleIx({ payer: wallet, holder: cp.publicKey, mint: AGTR }));
+  tx.add(new TransactionInstruction({
+    programId: new PublicKey(DBC_PROGRAM),
+    keys: [
+      { pubkey: wallet, isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(AGTR_POOL), isSigner: false, isWritable: true },
+      { pubkey: mintPk, isSigner: false, isWritable: false },
+      { pubkey: ata, isSigner: false, isWritable: true },
+    ],
+    data: Buffer.concat([Buffer.from('b75d992818e6c297', 'hex'), Buffer.alloc(23, 7)]),
+  }));
+  tx.add(new TransactionInstruction({ programId: new PublicKey(MEMO_PROGRAM), keys: [], data: Buffer.from('agentonly-runtime fixture 33') }));
+  return { tx, ata };
+}
+function settleSellStates({ wallet, ata, cp, cpAta, ownPost, cpPost, vaultPre, vaultPost }) {
+  const SYS = new PublicKey('11111111111111111111111111111111');
+  const T22 = new PublicKey(TOKEN_2022_PROGRAM);
+  const preFor = (addr) => {
+    if (addr === wallet) return acctState(100_000_000, Buffer.alloc(0), SYS);
+    if (addr === ata) return acctState(2_039_280, stdTokenBlob(AGTR, wallet, 1000), T22);
+    if (addr === cpAta) return acctState(2_039_280, stdTokenBlob(AGTR, cp, 50), T22);
+    if (addr === DIST_VAULT) return acctState(1_539_240, stdTokenBlob(AGTR, DIST_STATE, vaultPre), T22);
+    if (addr === AGTR_POOL) return acctState(5_000_000, Buffer.alloc(0), new PublicKey(DBC_PROGRAM));
+    return null;
+  };
+  const postFor = (addr) => {
+    if (addr === wallet) return acctState(100_000_000 + 8_500_000, Buffer.alloc(0), SYS);
+    if (addr === ata) return acctState(2_039_280, stdTokenBlob(AGTR, wallet, ownPost), T22);
+    if (addr === cpAta) return acctState(2_039_280, stdTokenBlob(AGTR, cp, cpPost), T22);
+    if (addr === DIST_VAULT) return acctState(1_539_240, stdTokenBlob(AGTR, DIST_STATE, vaultPost), T22);
+    if (addr === AGTR_POOL) return acctState(5_000_000, Buffer.alloc(0), new PublicKey(DBC_PROGRAM));
+    return null;
+  };
+  return { preFor, postFor };
+}
+
+{
+  const kp = Keypair.generate();
+  const cp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const { tx, ata } = buildSettleSellTx({ kp, cp, blockhash, lvbh });
+  const cpAta = associatedTokenAddress(new PublicKey(AGTR), cp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+  // own ATA: 1000 − 100 (swap debit) + 250 (own payout) = 1150;
+  // counterparty ATA: 50 + 400 (its payout) = 450; vault: 1000 − 650.
+  const { preFor, postFor } = settleSellStates({ wallet, ata: ata.toBase58(), cp: cp.publicKey.toBase58(), cpAta, ownPost: 1150, cpPost: 450, vaultPre: 1000, vaultPost: 350 });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1, vaultBalance: 1000n });
+  const gwFetch = sellGwFetch(txB64, blockhash, lvbh);
+  let ok = false; const lines = [];
+  try {
+    const card = await prepareTrade({ wallet, mint: AGTR, side: 'sell', amount: '0.0001', signerType: 'own', fetchImpl: gwFetch, connection: conn, tokenJson: TOKEN_JSON_STUB });
+    const sp = card.validation.settlementPayout;
+    lines.push(`card settlement model: maxRaw=${sp?.maxRaw} (vault balance at prepare), minRaw=${sp?.minRaw}, recipients=${sp?.holderAtas.length}, ownAta set=${sp?.ownAta === ata.toBase58()}`);
+    const receipt = await sendCard({ keypair: kp, card, approve: card.approvalToken, connection: conn, fetchImpl: gwFetch, tokenJson: TOKEN_JSON_STUB });
+    ok = sp?.maxRaw === '1000'
+      && sp?.holderAtas.includes(ata.toBase58()) && sp?.holderAtas.includes(cpAta)
+      && receipt.mode === 'broadcast' && rawSends() === 1
+      && receipt.deltas.tokenDelta === '150'
+      && receipt.deltas.settlementPayoutRaw === '650';
+    lines.push(`send: mode=${receipt.mode}, tokenDelta=${receipt.deltas.tokenDelta} (= −100 swap + 250 own payout), settlementPayoutRaw=${receipt.deltas.settlementPayoutRaw} (250 own + 400 counterparty), sends=${rawSends()}`);
+  } catch (e) {
+    lines.push(`threw ${e.code ?? ''}: ${e.message.slice(0, 220)}`);
+  }
+  report(33, 'bundled-settle sell — payout modeled, bounded, decomposed; the sell passes end to end (P1-1)', ok, lines);
+}
+
+{
+  const kp = Keypair.generate();
+  const cp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const { tx, ata } = buildSettleSellTx({ kp, cp, blockhash, lvbh });
+  const cpAta = associatedTokenAddress(new PublicKey(AGTR), cp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+  // The card's bound is the prepare-time vault balance (1,000), but
+  // the simulation pays the wallet 1,100 (own ATA 1000 − 100 + 1100)
+  // and the vault 1,500 total — over the approved bound.
+  const { preFor, postFor } = settleSellStates({ wallet, ata: ata.toBase58(), cp: cp.publicKey.toBase58(), cpAta, ownPost: 2000, cpPost: 450, vaultPre: 5000, vaultPost: 3500 });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1, vaultBalance: 1000n });
+  const gwFetch = sellGwFetch(txB64, blockhash, lvbh);
+  let ok = false; const lines = [];
+  try {
+    const card = await prepareTrade({ wallet, mint: AGTR, side: 'sell', amount: '0.0001', signerType: 'own', fetchImpl: gwFetch, connection: conn, tokenJson: TOKEN_JSON_STUB });
+    lines.push(`card settlement bound: maxRaw=${card.validation.settlementPayout?.maxRaw}`);
+    await sendCard({ keypair: kp, card, approve: card.approvalToken, connection: conn, fetchImpl: gwFetch, tokenJson: TOKEN_JSON_STUB });
+    lines.push('sendCard DID NOT throw — a payout over the modeled bound was allowed');
+  } catch (e) {
+    ok = (e.code === 'ECONOMIC_BOUND_EXCEEDED' || e.code === 'SETTLEMENT_PAYOUT_EXCEEDS_MAX') && rawSends() === 0;
+    lines.push(`send threw ${e.code ?? ''}: ${e.message.slice(0, 180)}…`);
+    lines.push(`sendRawTransaction calls=${rawSends()} (must be 0)`);
+  }
+  report(34, 'settlement payout over the modeled bound — refused, nothing broadcast (P1-1)', ok, lines);
+}
+
+// Fixture 35 — P1-1: a settle paying a stranger. (a) The recipient is
+// not the holder's derived token account (holder = wallet, recipient
+// = a stranger's ATA); (b) the vault named is not the canonical
+// record's distributor vault. Both refuse at prepare classification.
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const ata = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const { preFor, postFor } = buyStateFns({ wallet, ata, pool: AGTR_POOL });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+  const lines = [];
+  let ok = true;
+  const variants = [
+    ['recipient is a stranger\u2019s ATA, not the holder\u2019s derived account', (ix) => {
+      const strangerAta = associatedTokenAddress(new PublicKey(AGTR), Keypair.generate().publicKey, TOKEN_2022_PROGRAM);
+      ix.keys[2].pubkey = strangerAta;
+      return ix;
+    }],
+    ['vault is not the canonical distributor vault', (ix) => {
+      ix.keys[5].pubkey = Keypair.generate().publicKey;
+      return ix;
+    }],
+  ];
+  for (const [name, mutate] of variants) {
+    const tx = buildTradeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+    tx.add(mutate(settleIx({ payer: kp.publicKey, holder: kp.publicKey, mint: AGTR })));
+    const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+    let code = 'NO-THROW';
+    try {
+      await prepareTrade({ wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own', fetchImpl: makeGwFetch(stubBuild(txB64, blockhash, lvbh)), connection: conn, tokenJson: TOKEN_JSON_STUB });
+    } catch (e) { code = e.code ?? 'ERR'; }
+    const good = code === 'UNCLASSIFIED_INSTRUCTION';
+    ok = ok && good;
+    lines.push(`${name}: refused at prepare=${good} code=${code}`);
+  }
+  // Control — the production counterparty form: the counterparty's
+  // settle pays the pool token vault the venue swap itself names
+  // (the curve build's base vault — how the live AGTR build settles
+  // the pool authority). That shape must classify and model.
+  {
+    const cp = Keypair.generate();
+    const swapVault = Keypair.generate().publicKey;
+    const tx = buildTradeTx({
+      kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh,
+      extraKeys: [{ pubkey: swapVault, isSigner: false, isWritable: true }],
+    });
+    const settle = settleIx({ payer: kp.publicKey, holder: cp.publicKey, mint: AGTR });
+    settle.keys[2].pubkey = swapVault;
+    tx.add(settle);
+    const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+    let modeled = false;
+    try {
+      const card = await prepareTrade({ wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own', fetchImpl: makeGwFetch(stubBuild(txB64, blockhash, lvbh)), connection: conn, tokenJson: TOKEN_JSON_STUB });
+      modeled = (card.validation.settlementPayout?.holderAtas ?? []).includes(swapVault.toBase58());
+      lines.push(`counterparty settle paying the swap-named pool vault: classified + modeled=${modeled}`);
+    } catch (e) {
+      lines.push(`counterparty settle paying the swap-named pool vault: threw ${e.code ?? ''}: ${e.message.slice(0, 140)}`);
+    }
+    ok = ok && modeled;
+  }
+  ok = ok && rawSends() === 0;
+  lines.push(`sendRawTransaction calls=${rawSends()} (must be 0)`);
+  report(35, 'settle paying a stranger / naming a non-canonical vault — refused at prepare; the swap-named pool-vault form models (P1-1)', ok, lines);
+}
+
+// Fixture 36 — P1-5: the external-signer allowlist. An unenrolled
+// signer refuses; the enrolled signer works; the same signer with
+// changed bytes refuses on integrity; re-enrollment restores it.
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const dir = join(tmp, 'f36'); mkdirSync(dir, { recursive: true });
+  const keyFile = join(dir, 'signer.keypair.json'); writeKeypairFile(keyFile, kp);
+  const { blockhash, lvbh } = await liveBlockhash();
+  const state = makeTradeState(kp, blockhash, lvbh);
+  const stub = await startStub(state);
+  const env = {
+    AGENTONLY_GATEWAY_BASE: stub.url, AGENTONLY_RPC_URL: stub.url,
+    AGENTONLY_SIGNER_ALLOWLIST: join(dir, 'signers.json'),
+  };
+  const cardPath = join(dir, 'approval-card.json');
+  // A directly executable signer (shebang), like a hardware-wallet
+  // bridge binary: keyfile path arrives as a structured argv entry.
+  const signer = join(dir, 'signer.mjs');
+  const signerBody = `#!/usr/bin/env node
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+const { Keypair, Transaction } = createRequire(${JSON.stringify(join(ROOT, 'package.json'))})('@solana/web3.js');
+const kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(process.argv[2], 'utf8'))));
+let input = '';
+process.stdin.on('data', (d) => (input += d));
+process.stdin.on('end', () => {
+  const tx = Transaction.from(Buffer.from(input.trim(), 'base64'));
+  tx.partialSign(kp);
+  process.stdout.write(tx.serialize().toString('base64'));
+});
+`;
+  writeFileSync(signer, signerBody);
+  chmodSync(signer, 0o755);
+  const prep = await runCli(['prepare', '--signer-type', 'external', '--wallet', wallet, '--mint', AGTR, '--side', 'buy', '--amount', '0.01', '--out', cardPath], { cwd: dir, env });
+  const card = existsSync(cardPath) ? JSON.parse(readFileSync(cardPath, 'utf8')) : null;
+  const lines = [`external prepare exit=${prep.code}, card written=${!!card}`];
+  let ok = !!card;
+  if (card) {
+    const sendArgs = ['send', '--signer-type', 'external', '--external-signer', signer, '--external-signer-arg', keyFile, '--wallet', wallet, '--card', cardPath, '--approve', card.approvalToken, '--dry-run'];
+    const unenrolled = await runCli(sendArgs, { cwd: dir, env });
+    lines.push(`unenrolled signer: exit=${unenrolled.code}, code=${unenrolled.out.includes('SIGNER_ALLOWLIST_MISSING') ? 'SIGNER_ALLOWLIST_MISSING' : 'MISSING'}`);
+    const enroll = await runCli(['signer', 'enroll', '--path', signer], { cwd: dir, env });
+    lines.push(`enroll exit=${enroll.code}`);
+    const good = await runCli(sendArgs, { cwd: dir, env });
+    lines.push(`enrolled signer dry-run exit=${good.code}`);
+    writeFileSync(signer, signerBody + '// tampered after enrollment\n');
+    chmodSync(signer, 0o755);
+    const changed = await runCli(sendArgs, { cwd: dir, env });
+    lines.push(`bytes changed after enrollment: exit=${changed.code}, code=${changed.out.includes('SIGNER_INTEGRITY_MISMATCH') ? 'SIGNER_INTEGRITY_MISMATCH' : 'MISSING'}`);
+    const reenroll = await runCli(['signer', 'enroll', '--path', signer], { cwd: dir, env });
+    const restored = await runCli(sendArgs, { cwd: dir, env });
+    lines.push(`re-enrolled: enroll exit=${reenroll.code}, dry-run exit=${restored.code}`);
+    ok = unenrolled.code !== 0 && unenrolled.out.includes('SIGNER_ALLOWLIST_MISSING')
+      && enroll.code === 0
+      && good.code === 0 && good.out.includes('DRY RUN')
+      && changed.code !== 0 && changed.out.includes('SIGNER_INTEGRITY_MISMATCH')
+      && reenroll.code === 0 && restored.code === 0 && restored.out.includes('DRY RUN');
+  }
+  stub.server.close();
+  report(36, 'external-signer allowlist — unenrolled refuses, enrolled works, changed bytes refuse, re-enroll restores (P1-5)', ok, lines);
+}
+
+// Fixture 37 — P1-4: venue agreement at prepare. Unknown venue,
+// quote/build disagreement, and a missing venue all refuse before
+// any card exists.
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const tx = buildTradeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+  const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+  const ata = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const { preFor, postFor } = buyStateFns({ wallet, ata, pool: AGTR_POOL });
+  const { conn } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+  const mkGw = ({ quoteVenue, buildVenue }) => async (url) => {
+    const u = String(url);
+    const mk = (obj) => ({ ok: true, status: 200, json: async () => obj });
+    if (u.includes('/v1/trade/eligibility')) return mk({ ok: true, status: 'eligible', reasons: [] });
+    if (u.includes('/v1/trade/quote')) {
+      const q = { ok: true, amountIn: '10000000', amountOut: '500', minimumAmountOut: '495', fees: { total: '0' }, priceImpactBps: 0, symbol: 'AGTR' };
+      if (quoteVenue != null) q.venue = quoteVenue;
+      return mk(q);
+    }
+    if (u.includes('/v1/trade/build')) {
+      const b = stubBuild(txB64, blockhash, lvbh);
+      if (buildVenue == null) delete b.venue; else b.venue = buildVenue;
+      return mk({ ok: true, ...b });
+    }
+    throw new Error(`fixture 37: unexpected fetch ${u}`);
+  };
+  const cases = [
+    ['unknown venue on both quote and build', { quoteVenue: 'mars', buildVenue: 'mars' }, 'VENUE_UNKNOWN'],
+    ['quote says curve, build says house', { quoteVenue: 'curve', buildVenue: 'house' }, 'VENUE_MISMATCH'],
+    ['quote names no venue', { quoteVenue: null, buildVenue: 'curve' }, 'VENUE_MISSING'],
+  ];
+  const lines = [];
+  let ok = true;
+  for (const [name, venues, want] of cases) {
+    let code = 'NO-THROW';
+    try {
+      await prepareTrade({ wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own', fetchImpl: mkGw(venues), connection: conn, tokenJson: TOKEN_JSON_STUB });
+    } catch (e) { code = e.code ?? 'ERR'; }
+    const good = code === want;
+    ok = ok && good;
+    lines.push(`${name}: refused=${good} code=${code} (want ${want})`);
+  }
+  report(37, 'venue agreement at prepare — unknown / disagreed / missing venue all refuse (P1-4)', ok, lines);
+}
+
+// Fixture 38 — P1-7b: prepare --out onto a planted symlink refuses;
+// the file the link points at stays untouched and no card lands.
+{
+  const kp = Keypair.generate();
+  const dir = join(tmp, 'f38'); mkdirSync(dir, { recursive: true });
+  const file = join(dir, 'w.keypair.json'); writeKeypairFile(file, kp);
+  const { blockhash, lvbh } = await liveBlockhash();
+  const state = makeTradeState(kp, blockhash, lvbh);
+  const stub = await startStub(state);
+  const victim = join(dir, 'victim.json');
+  const sentinel = 'do-not-overwrite — planted victim file\n';
+  writeFileSync(victim, sentinel);
+  const outPath = join(dir, 'approval-card.json');
+  symlinkSync(victim, outPath);
+  const r = await runCli(
+    ['prepare', '--file', file, '--mint', AGTR, '--side', 'buy', '--amount', '0.01', '--out', outPath],
+    { cwd: dir, env: { AGENTONLY_GATEWAY_BASE: stub.url, AGENTONLY_RPC_URL: stub.url } },
+  );
+  stub.server.close();
+  const untouched = readFileSync(victim, 'utf8') === sentinel;
+  const ok = r.code !== 0 && r.out.includes('WRITE_SYMLINK_REFUSED') && untouched;
+  report(38, 'prepare --out onto a planted symlink — refused, victim untouched (P1-7b)', ok, [
+    `prepare exit=${r.code}, code=${r.out.includes('WRITE_SYMLINK_REFUSED') ? 'WRITE_SYMLINK_REFUSED' : 'MISSING'}, victim untouched=${untouched}`,
+    `message: ${r.out.trim().split('\n')[0].slice(0, 200)}…`,
+  ]);
+}
+
+// Fixture 39 — P1-6: a malformed confirmation response ({} and
+// { value: {} }) after broadcast is a FAILURE (CONFIRMATION_
+// UNVERIFIED), never a successful receipt.
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const tx = buildTradeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+  const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+  const ata = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const { preFor, postFor } = buyStateFns({ wallet, ata, pool: AGTR_POOL });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+  const gwFetch = makeGwFetch(stubBuild(txB64, blockhash, lvbh));
+  const lines = [];
+  let ok = true;
+  try {
+    const card = await prepareTrade({ wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own', fetchImpl: gwFetch, connection: conn, tokenJson: TOKEN_JSON_STUB });
+    for (const [name, conf] of [['{}', {}], ['{ value: {} }', { value: {} }]]) {
+      conn.confirmTransaction = async () => conf;
+      let code = 'NO-THROW';
+      try {
+        await sendCard({ keypair: kp, card, approve: card.approvalToken, connection: conn, fetchImpl: gwFetch, tokenJson: TOKEN_JSON_STUB });
+      } catch (e) { code = e.code ?? 'ERR'; }
+      const good = code === 'CONFIRMATION_UNVERIFIED';
+      ok = ok && good;
+      lines.push(`confirmation ${name}: reported as failure=${good} code=${code}`);
+    }
+    ok = ok && rawSends() === 2;
+    lines.push(`sendRawTransaction calls=${rawSends()} (must be 2 — both transactions WERE broadcast; their unverifiable outcomes are what is reported)`);
+  } catch (e) {
+    ok = false;
+    lines.push(`setup failure: ${e.code ?? ''} ${e.message.slice(0, 200)}`);
+  }
+  report(39, 'malformed confirmation — failure, never a receipt (P1-6)', ok, lines);
+}
+
+// Fixture 40 — P1-8: the displayed fees and price impact are bound
+// into the approval token (policy version 2). Post-approval edits to
+// either refuse with POLICY_BINDING_MISMATCH; the unaltered card
+// passes.
+{
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  const tx = buildTradeTx({ kp, mint: AGTR, pool: AGTR_POOL, blockhash, lvbh });
+  const txB64 = tx.serialize({ requireAllSignatures: false }).toString('base64');
+  const ata = associatedTokenAddress(new PublicKey(AGTR), kp.publicKey, TOKEN_2022_PROGRAM).toBase58();
+  const { preFor, postFor } = buyStateFns({ wallet, ata, pool: AGTR_POOL });
+  const { conn, rawSends } = makeDoubleConn({ preFor, postFor, blockHeight: lvbh - 1 });
+  const gwFetch = makeGwFetch(stubBuild(txB64, blockhash, lvbh));
+  const lines = [];
+  let ok = true;
+  try {
+    const card = await prepareTrade({ wallet, mint: AGTR, side: 'buy', amount: '0.01', signerType: 'own', fetchImpl: gwFetch, connection: conn, tokenJson: TOKEN_JSON_STUB });
+    const control = await sendCard({ keypair: kp, card, approve: card.approvalToken, dryRun: true, connection: conn, fetchImpl: gwFetch, tokenJson: TOKEN_JSON_STUB });
+    lines.push(`control (unaltered card): dry-run mode=${control.mode}`);
+    const mutations = [
+      ['displayed fees (fees.total 0 → 999)', (c) => { c.fees = { total: '999' }; }],
+      ['displayed price impact (0 → 55 bps)', (c) => { c.priceImpactBps = 55; }],
+    ];
+    for (const [field, mutate] of mutations) {
+      const forged = JSON.parse(JSON.stringify(card));
+      mutate(forged);
+      let code = 'NO-THROW';
+      try {
+        await sendCard({ keypair: kp, card: forged, approve: card.approvalToken, dryRun: true, connection: conn, fetchImpl: gwFetch, tokenJson: TOKEN_JSON_STUB });
+      } catch (e) { code = e.code ?? 'ERR'; }
+      const good = code === 'POLICY_BINDING_MISMATCH';
+      ok = ok && good;
+      lines.push(`alter ${field} after approval: refused=${good} code=${code}`);
+    }
+    ok = ok && rawSends() === 0;
+    lines.push(`sendRawTransaction calls=${rawSends()} (must be 0)`);
+  } catch (e) {
+    ok = false;
+    lines.push(`setup failure: ${e.code ?? ''} ${e.message.slice(0, 200)}`);
+  }
+  report(40, 'displayed fees / price impact bound into the approval token (P1-8)', ok, lines);
+}
+
+// Fixture 41 — P1-2: HouseSwap exact format. The production swap
+// (tag 1, dir matching the side, exactly 18 data bytes, the canonical
+// 10-account layout) validates; a wrong tag, a wrong-direction swap,
+// a lookalike vault in a fixed position, and embedded terms that
+// disagree with the approved terms all refuse.
+{
+  const HPROOF = '5hXj8x3UCx4VqxpoyrNQTbfQxp4MAqjzTj3xqbJDSZEn';
+  const pool = housePoolPda(HPROOF);
+  const tokenJsonHouse = { mint: HPROOF, symbol: 'HPROOF', decimals: 6, addresses: { pool } };
+  const kp = Keypair.generate();
+  const wallet = kp.publicKey.toBase58();
+  const blockhash = Keypair.generate().publicKey.toBase58();
+  const lvbh = 500_000_000;
+  function buildHouseTx({ dir = 0, tag = 1, amountIn = 1_000_000n, minOut = 900_000n, mutateKeys = null } = {}) {
+    const mintPk = new PublicKey(HPROOF);
+    const poolPk = new PublicKey(pool);
+    const data = Buffer.alloc(18);
+    data[0] = tag; data[1] = dir;
+    data.writeBigUInt64LE(amountIn, 2);
+    data.writeBigUInt64LE(minOut, 10);
+    let keys = [
+      { pubkey: poolPk, isSigner: false, isWritable: true },
+      { pubkey: mintPk, isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(WSOL_MINT), isSigner: false, isWritable: false },
+      { pubkey: associatedTokenAddress(mintPk, poolPk, TOKEN_2022_PROGRAM), isSigner: false, isWritable: true },
+      { pubkey: associatedTokenAddress(new PublicKey(WSOL_MINT), poolPk, TOKEN_PROGRAM_ID), isSigner: false, isWritable: true },
+      { pubkey: associatedTokenAddress(mintPk, kp.publicKey, TOKEN_2022_PROGRAM), isSigner: false, isWritable: true },
+      { pubkey: associatedTokenAddress(new PublicKey(WSOL_MINT), kp.publicKey, TOKEN_PROGRAM_ID), isSigner: false, isWritable: true },
+      { pubkey: kp.publicKey, isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(TOKEN_2022_PROGRAM), isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(TOKEN_PROGRAM_ID), isSigner: false, isWritable: false },
+    ];
+    if (mutateKeys) keys = mutateKeys(keys);
+    const tx = new Transaction({ feePayer: kp.publicKey, blockhash, lastValidBlockHeight: lvbh });
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }));
+    tx.add(new TransactionInstruction({ programId: new PublicKey(PLATFORM_PROGRAMS.house), keys, data }));
+    tx.add(new TransactionInstruction({ programId: new PublicKey(MEMO_PROGRAM), keys: [], data: Buffer.from('agentonly-runtime fixture 41') }));
+    return tx;
+  }
+  const ctx = { wallet, mint: HPROOF, side: 'buy', venue: 'house', tokenJson: tokenJsonHouse, amountInRaw: '1000000', minimumAmountOutRaw: '900000' };
+  const lines = [];
+  let ok = true;
+  const run = async (tx) => {
+    const intent = await deriveIntent(tx.serialize({ requireAllSignatures: false }).toString('base64'));
+    return validateIntent(intent, ctx);
+  };
+  try {
+    const good = await run(buildHouseTx());
+    const goodOk = good.venueProgram === PLATFORM_PROGRAMS.house;
+    ok = ok && goodOk;
+    lines.push(`production house swap shape: validates=${goodOk} venueProgram=${good.venueProgram?.slice(0, 8)}…`);
+  } catch (e) {
+    ok = false;
+    lines.push(`production house swap shape: threw ${e.code ?? ''}: ${e.message.slice(0, 160)}`);
+  }
+  const badCases = [
+    ['wrong tag (data[0] = 2)', buildHouseTx({ tag: 2 }), 'UNCLASSIFIED_INSTRUCTION'],
+    ['direction contradicts the side (sell swap on a buy card)', buildHouseTx({ dir: 1 }), 'UNCLASSIFIED_INSTRUCTION'],
+    ['lookalike token vault in the fixed layout', buildHouseTx({ mutateKeys: (keys) => { keys[3] = { pubkey: Keypair.generate().publicKey, isSigner: false, isWritable: true }; return keys; } }), 'UNCLASSIFIED_INSTRUCTION'],
+    ['embedded amount_in disagrees with the approved amount', buildHouseTx({ amountIn: 2_000_000n }), 'VENUE_TERMS_MISMATCH'],
+    ['embedded min_out undercuts the approved minimum', buildHouseTx({ minOut: 100n }), 'VENUE_TERMS_MISMATCH'],
+  ];
+  for (const [name, tx, want] of badCases) {
+    let code = 'NO-THROW';
+    try { await run(tx); } catch (e) { code = e.code ?? 'ERR'; }
+    const goodCase = code === want;
+    ok = ok && goodCase;
+    lines.push(`${name}: refused=${goodCase} code=${code} (want ${want})`);
+  }
+  report(41, 'HouseSwap exact format — tag, direction, data size, canonical layout, embedded terms (P1-2)', ok, lines);
 }
 
 // ---------------------------------------------------------------------------
