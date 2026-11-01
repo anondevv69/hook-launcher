@@ -8,6 +8,12 @@
 //                                   stamp the sidecar from a LATER session;
 //                                   prepare/send refuse un-attested
 //                                   runtime-created wallets
+//   signer enroll --path <exe>      enroll an external signer executable
+//                                   (absolute path + SHA-256 of its bytes)
+//                                   in the user-owned signer allowlist;
+//                                   sends refuse unenrolled or changed
+//                                   signers (repair round 4, P1-5)
+//   signer list                     show the enrolled signers
 //   inspect <mint>                  readable token + market summary
 //   prepare --file <keypair> --mint <mint> --side buy|sell --amount <ui>
 //                                   [--signer-type own|sandbox]
@@ -25,7 +31,7 @@
 // Exit codes: 0 ok · 1 refusal/error · 3 persistence handshake mismatch.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Connection, Keypair } from '@solana/web3.js';
@@ -35,6 +41,7 @@ import {
   RuntimeError,
   assertSignerSupported,
   assertWalletAttested,
+  enrollSigner,
   fetchTokenRecord,
   formatCard,
   formatInspect,
@@ -42,9 +49,12 @@ import {
   keypairFileSha256,
   loadKeypair,
   prepareTrade,
+  readSignerAllowlist,
   readWalletSidecar,
   sendCard,
+  signerAllowlistPath,
   walletSidecarPath,
+  writeFileAtomicSafe,
   writeKeypairFile,
   writeWalletSidecar,
 } from './runtime.mjs';
@@ -174,6 +184,34 @@ async function walletAttest(flags) {
   console.log('This records that the keypair file was still readable in a session later than its creation. It is evidence, not a guarantee — keep your own backup of any wallet holding meaningful funds.');
 }
 
+// --- signer enrollment (repair round 4, P1-5) --------------------------------
+// Enrollment is the USER's act, done ahead of any send: it records the
+// executable's absolute path + SHA-256 of its bytes in the user-owned
+// allowlist. The send path only consults it — an agent-supplied
+// --external-signer value can no longer execute an arbitrary binary.
+
+async function signerEnroll(flags) {
+  const path = flags.path;
+  if (!path) throw new RuntimeError('INVALID_ARGS', 'signer enroll requires --path <executable>');
+  const entry = enrollSigner(path);
+  console.log(`signer enrolled: ${entry.path}`);
+  console.log(`  sha256: ${entry.sha256}`);
+  console.log(`  allowlist: ${entry.allowlistPath} (owner-only, 0600)`);
+  console.log('A send naming this exact path will run it only while its bytes still hash to the enrolled sha256. Re-run enroll after any deliberate signer update.');
+}
+
+async function signerList() {
+  const doc = readSignerAllowlist();
+  if (!doc || doc.signers.length === 0) {
+    console.log(`no signers enrolled (allowlist: ${signerAllowlistPath()})`);
+    return;
+  }
+  console.log(`signer allowlist: ${signerAllowlistPath()}`);
+  for (const s of doc.signers) {
+    console.log(`  ${s.path}  sha256 ${s.sha256}  enrolled ${s.enrolledAt}`);
+  }
+}
+
 // --- main --------------------------------------------------------------------
 
 async function main() {
@@ -183,6 +221,9 @@ async function main() {
   if (cmd === 'wallet' && sub === 'create') return walletCreate(flags);
   if (cmd === 'wallet' && sub === 'show') return walletShow(flags);
   if (cmd === 'wallet' && sub === 'attest-persistence') return walletAttest(flags);
+
+  if (cmd === 'signer' && sub === 'enroll') return signerEnroll(flags);
+  if (cmd === 'signer' && sub === 'list') return signerList();
 
   if (cmd === 'inspect') {
     const mint = sub;
@@ -217,7 +258,10 @@ async function main() {
     });
     const out = flags.out ?? './approval-card.json';
     card.cardFile = out;
-    writeFileSync(out, JSON.stringify(card, null, 2));
+    // Repair round 4, P1-7b: the card write is exclusive of symlinks
+    // and atomic (temp file + rename) — a planted symlink at the
+    // output path refuses instead of redirecting the write.
+    writeFileAtomicSafe(out, JSON.stringify(card, null, 2) + '\n', 0o600);
     console.log(formatCard(card));
     console.log(`\ncard written: ${out}`);
     console.log('Nothing has been signed or sent. The card expires at the block height above.');
@@ -283,6 +327,8 @@ async function main() {
   console.error('  agentonly-runtime wallet create --file <path>');
   console.error('  agentonly-runtime wallet show --file <path>');
   console.error('  agentonly-runtime wallet attest-persistence --file <path>');
+  console.error('  agentonly-runtime signer enroll --path <executable>');
+  console.error('  agentonly-runtime signer list');
   console.error('  agentonly-runtime inspect <mint>');
   console.error('  agentonly-runtime prepare --file <keypair> --mint <mint> --side buy|sell --amount <ui> [--signer-type own|sandbox] [--max-fee-lamports <n>] [--out ./approval-card.json]');
   console.error('  agentonly-runtime prepare --signer-type external --wallet <address> --mint <mint> --side buy|sell --amount <ui> [--out ./approval-card.json]');
