@@ -23,6 +23,28 @@ import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+// Clean-tree requirement (repair round 3, P1-7): the manifest names a
+// sourceCommit, and that claim is only meaningful if the commit fully
+// determines the built bytes. Building from a dirty tree would bind
+// the release to a commit that does NOT contain the shipped sources.
+// Refuse: commit the release inputs (runtime/, mcp/, scripts/) first,
+// then build. Untracked files under dist/ (this build's own output
+// directory) are the only exemption.
+{
+  const porcelain = execFileSync('git', ['status', '--porcelain'], { cwd: root }).toString()
+    .split('\n').filter(Boolean);
+  const dirty = porcelain.filter((line) => {
+    const p = line.slice(3).trim().replace(/^"|"$/g, '');
+    return !p.startsWith('dist/');
+  });
+  if (dirty.length) {
+    throw new Error(
+      `refusing to build a release from a dirty working tree — the manifest's sourceCommit must fully determine the artifact bytes. Commit (or stash) these changes first:\n  ${dirty.join('\n  ')}`,
+    );
+  }
+}
+
 const dist = process.env.AONLY_DIST || join(root, 'dist');
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(dist, { recursive: true });

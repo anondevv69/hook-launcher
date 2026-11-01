@@ -116,16 +116,22 @@ if (!SKIP_REBUILD && existsSync(join(repoRoot, 'runtime', 'package.json')) && ex
 if (failures.length) { console.log('\nAborted: provenance mismatch — MCP will not be executed.'); process.exit(1); }
 
 // --- 5: MCP boundary, executed only now ---------------------------------------
+// Repair round 3, P1-6: the capability scan is a hard gate, not a
+// note. Round 2 scanned for forbidden strings but only RECORDED the
+// failure — the verifier then launched the artifact anyway and failed
+// at the end. A forbidden capability string now aborts verification
+// BEFORE the artifact is written to disk or spawned.
 const EXPECTED_TOOLS = ['inspect_token', 'list_events', 'quote', 'eligibility', 'build', 'simulate', 'verify'];
-const tmp = mkdtempSync(join(tmpdir(), 'aonly-verify-'));
-const mcpPath = join(tmp, 'agentonly-mcp.mjs');
-writeFileSync(mcpPath, fetched['agentonly-mcp.mjs']);
-
 const mcpText = fetched['agentonly-mcp.mjs'].toString('utf8');
 for (const bad of ['sendRawTransaction', 'Keypair.fromSecretKey', 'signTransaction', 'transfer']) {
   if (mcpText.includes(bad)) fail(`MCP artifact contains forbidden capability string: ${bad}`);
 }
-ok('MCP artifact carries no sign/broadcast/transfer capability strings (beyond any flagged above)');
+if (failures.length) { console.log('\nAborted: forbidden capability string in the MCP artifact — it will NOT be executed.'); process.exit(1); }
+ok('MCP artifact carries no sign/broadcast/transfer capability strings');
+
+const tmp = mkdtempSync(join(tmpdir(), 'aonly-verify-'));
+const mcpPath = join(tmp, 'agentonly-mcp.mjs');
+writeFileSync(mcpPath, fetched['agentonly-mcp.mjs']);
 
 function mcpSession(requests) {
   return new Promise((resolve, reject) => {
