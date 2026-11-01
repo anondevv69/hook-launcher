@@ -8,11 +8,15 @@
 //                                   stamp the sidecar from a LATER session;
 //                                   prepare/send refuse un-attested
 //                                   runtime-created wallets
-//   signer enroll --path <exe>      enroll an external signer executable
-//                                   (absolute path + SHA-256 of its bytes)
-//                                   in the user-owned signer allowlist;
-//                                   sends refuse unenrolled or changed
-//                                   signers (repair round 4, P1-5)
+//   signer enroll --path <exe>      enroll an external signer invocation
+//        [--arg <value> ...]        (executable absolute path + SHA-256,
+//                                   plus an argv template whose file
+//                                   arguments are hashed too) in the
+//                                   user-owned signer allowlist; sends
+//                                   refuse unenrolled signers, changed
+//                                   invocation components, and any
+//                                   send-time signer arguments (repair
+//                                   round 4, P1-5; round 5, TIGHTEN-2)
 //   signer list                     show the enrolled signers
 //   inspect <mint>                  readable token + market summary
 //   prepare --file <keypair> --mint <mint> --side buy|sell --amount <ui>
@@ -24,9 +28,9 @@
 //   send --file <keypair> --card <card.json> --approve <approval-token>
 //        [--dry-run] [--signer-type ...]
 //   send --signer-type external --external-signer <executable-path>
-//        [--external-signer-arg <value> ...]
 //        --wallet <address> --card <card.json> --approve <approval-token>
-//        [--dry-run]
+//        [--dry-run]                 (no signer arguments at send time —
+//                                   the invocation was fixed at enrollment)
 //
 // Exit codes: 0 ok · 1 refusal/error · 3 persistence handshake mismatch.
 
@@ -69,8 +73,11 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const key = a.slice(2);
       if (key === 'dry-run') flags[key] = true;
-      else if (key === 'external-signer-arg') {
-        // Repeatable: structured argv for the external signer.
+      else if (key === 'arg' || key === 'external-signer-arg') {
+        // Repeatable: 'arg' carries signer-enrollment template values;
+        // 'external-signer-arg' is the retired send-time form — still
+        // parsed so the send path can refuse it by name (repair
+        // round 5, TIGHTEN-2) instead of silently ignoring it.
         (flags[key] ??= []).push(argv[++i]);
       } else flags[key] = argv[++i];
     } else positional.push(a);
@@ -184,20 +191,28 @@ async function walletAttest(flags) {
   console.log('This records that the keypair file was still readable in a session later than its creation. It is evidence, not a guarantee — keep your own backup of any wallet holding meaningful funds.');
 }
 
-// --- signer enrollment (repair round 4, P1-5) --------------------------------
+// --- signer enrollment (repair round 4, P1-5; round 5, TIGHTEN-2) -----------
 // Enrollment is the USER's act, done ahead of any send: it records the
-// executable's absolute path + SHA-256 of its bytes in the user-owned
-// allowlist. The send path only consults it — an agent-supplied
-// --external-signer value can no longer execute an arbitrary binary.
+// COMPLETE invocation — the executable's absolute path + SHA-256 and
+// an argv template whose file arguments (script, key file, config)
+// are hashed as well — in the user-owned allowlist. The send path
+// only consults it: a send names the enrolled path and nothing else,
+// so no agent-supplied value can change what executes or with what
+// arguments.
 
 async function signerEnroll(flags) {
   const path = flags.path;
   if (!path) throw new RuntimeError('INVALID_ARGS', 'signer enroll requires --path <executable>');
-  const entry = enrollSigner(path);
+  const entry = enrollSigner(path, flags.arg ?? []);
   console.log(`signer enrolled: ${entry.path}`);
-  console.log(`  sha256: ${entry.sha256}`);
+  console.log(`  executable sha256: ${entry.sha256}`);
+  for (const a of entry.args ?? []) {
+    console.log(a.type === 'file'
+      ? `  arg (file):    ${a.path}  sha256 ${a.sha256}`
+      : `  arg (literal): ${a.value}`);
+  }
   console.log(`  allowlist: ${entry.allowlistPath} (owner-only, 0600)`);
-  console.log('A send naming this exact path will run it only while its bytes still hash to the enrolled sha256. Re-run enroll after any deliberate signer update.');
+  console.log('A send naming this exact path runs EXACTLY this invocation while every component still hashes to its enrolled sha256. Re-run enroll after any deliberate change to the executable, the script, or any file argument.');
 }
 
 async function signerList() {
@@ -209,6 +224,11 @@ async function signerList() {
   console.log(`signer allowlist: ${signerAllowlistPath()}`);
   for (const s of doc.signers) {
     console.log(`  ${s.path}  sha256 ${s.sha256}  enrolled ${s.enrolledAt}`);
+    for (const a of s.args ?? []) {
+      console.log(a.type === 'file'
+        ? `    arg (file):    ${a.path}  sha256 ${a.sha256}`
+        : `    arg (literal): ${a.value}`);
+    }
   }
 }
 
@@ -284,9 +304,17 @@ async function main() {
     let external = null;
     if (signerType === 'external') {
       if (!flags['external-signer'] || !flags.wallet) {
-        throw new RuntimeError('INVALID_ARGS', 'external send requires --external-signer <executable-path> [--external-signer-arg <value> ...] and --wallet <address>');
+        throw new RuntimeError('INVALID_ARGS', 'external send requires --external-signer <executable-path> and --wallet <address>');
       }
-      external = { address: flags.wallet, command: flags['external-signer'], args: flags['external-signer-arg'] ?? [] };
+      // Repair round 5, TIGHTEN-2: send-time signer arguments are
+      // refused outright — the invocation was fixed at enrollment.
+      if ((flags['external-signer-arg'] ?? []).length > 0) {
+        throw new RuntimeError(
+          'EXTERNAL_SIGNER_ARGS_REFUSED',
+          'refusing: --external-signer-arg no longer exists at send time. The external signer\u2019s complete invocation (executable + arguments) is bound at enrollment — enroll the intended invocation with: agentonly-runtime signer enroll --path <executable> [--arg <value>...]',
+        );
+      }
+      external = { address: flags.wallet, command: flags['external-signer'] };
     } else {
       if (!flags.file) throw new RuntimeError('INVALID_ARGS', 'send requires --file <keypair>');
       assertWalletAttested(flags.file);
@@ -314,6 +342,9 @@ async function main() {
       console.log(`simulation err: ${JSON.stringify(result.simulation.err)} · units consumed: ${result.simulation.unitsConsumed}`);
       if (result.deltas) {
         console.log(`simulated deltas: SOL ${result.deltas.solDelta} lamports · token ${result.deltas.tokenDelta} raw units`);
+        if (result.deltas.settlementOwnPayoutRaw != null) {
+          console.log(`settlement payout to this wallet (measured independently from the settle instructions' own transfers): ${result.deltas.settlementOwnPayoutRaw} raw units · total vault outflow ${result.deltas.settlementPayoutRaw} raw units`);
+        }
       }
       console.log('Simulation passed; full-effect accounting and the card bounds are enforced. Re-run without --dry-run (same card, same approval) to broadcast.');
     } else {
@@ -327,13 +358,13 @@ async function main() {
   console.error('  agentonly-runtime wallet create --file <path>');
   console.error('  agentonly-runtime wallet show --file <path>');
   console.error('  agentonly-runtime wallet attest-persistence --file <path>');
-  console.error('  agentonly-runtime signer enroll --path <executable>');
+  console.error('  agentonly-runtime signer enroll --path <executable> [--arg <value> ...]');
   console.error('  agentonly-runtime signer list');
   console.error('  agentonly-runtime inspect <mint>');
   console.error('  agentonly-runtime prepare --file <keypair> --mint <mint> --side buy|sell --amount <ui> [--signer-type own|sandbox] [--max-fee-lamports <n>] [--out ./approval-card.json]');
   console.error('  agentonly-runtime prepare --signer-type external --wallet <address> --mint <mint> --side buy|sell --amount <ui> [--out ./approval-card.json]');
   console.error('  agentonly-runtime send --file <keypair> --card <card.json> --approve <approval-token> [--dry-run]');
-  console.error('  agentonly-runtime send --signer-type external --external-signer <executable-path> [--external-signer-arg <value> ...] --wallet <address> --card <card.json> --approve <approval-token> [--dry-run]');
+  console.error('  agentonly-runtime send --signer-type external --external-signer <executable-path> --wallet <address> --card <card.json> --approve <approval-token> [--dry-run]');
   process.exit(2);
 }
 
